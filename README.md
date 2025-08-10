@@ -157,12 +157,18 @@ Logs are stored at log-YYYY-MM-DD.txt.
 Control verbosity with LOG_LEVEL (e.g., DEBUG, INFO, ERROR).
 Enable advanced health checks in api_quotex/monitoring.py.
 
+---
 
 🧪 Testing
 Run the example script:
+
+```bash
 python test4.py
+```
 
 Ensure all operations complete without errors.
+
+---
 
 ❓ Troubleshooting
 
@@ -174,6 +180,8 @@ Order not placed: Ensure asset is open and sufficient balance (check for not_mon
 
 For further help, open an issue on GitHub.
 
+---
+
 🤝 Contributing
 Contributions are welcome! Please:
 
@@ -184,14 +192,19 @@ Submit a Pull Request.
 
 Follow existing code style and PEP8 guidelines.
 
+---
+
 📄 License
 This project is licensed under the MIT License. See LICENSE for details.
+
+---
 
 📬 Contact
 
 Author: Ahmed (ar123ksa@gmail.com)
 Telegram: @A11ksa
 
+---
 
 ⚠️ Disclaimer
 This library is for educational and research purposes. Not affiliated with Quotex. Trading involves risk — use at your own discretion.```
