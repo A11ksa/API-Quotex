@@ -194,17 +194,19 @@ Follow existing code style and PEP8 guidelines.
 
 ---
 
-📄 License
-This project is licensed under the MIT License. See LICENSE for details.
+## 📄 License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
 
 ---
 
-📬 Contact
+## 📬 Contact
 
-Author: Ahmed (ar123ksa@gmail.com)
-Telegram: @A11ksa
+* **Author:** Ahmed (<a href="mailto:ar123ksa@gmail.com">[ar123ksa@gmail.com](mailto:ar123ksa@gmail.com)</a>)
+* **Telegram:** [@A11ksa](https://t.me/A11ksa)
 
 ---
 
-⚠️ Disclaimer
-This library is for educational and research purposes. Not affiliated with Quotex. Trading involves risk — use at your own discretion.```
+## ⚠️ Disclaimer
+
+This library is for educational and research purposes. Not affiliated with Pocket Option. Trading involves risk — use at your own discretion.
