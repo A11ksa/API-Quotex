@@ -155,8 +155,8 @@ print(status, profit)
 
 ```json
 {
-    "live": "42["authorization",{"session":"A8i6rBIfrfrfUYD9BkfGKv00000akJkSeouX73q","isDemo":0,"tournamentId":0}]",
-    "demo": "42["authorization",{"session":"A8i6rBIfrfrfUYD9BkfGKv00000akJkSeouX73q","isDemo":1,"tournamentId":0}]"
+  "live": "42[\"authorization\",{\"session\":\"A8i6rBIfrfrfUYD9BkfGKv00000akJkSeouX73q\",\"isDemo\":0,\"tournamentId\":0}]",
+  "demo": "42[\"authorization\",{\"session\":\"A8i6rBIfrfrfUYD9BkfGKv00000akJkSeouX73q\",\"isDemo\":1,\"tournamentId\":0}]"
 }
 ```
 
