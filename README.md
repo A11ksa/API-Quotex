@@ -5,11 +5,11 @@
 <p><b>High-performance, production-ready Python client with <u>Playwright</u> login (SSID) & full trade lifecycle.</b></p>
 
 <p>
-  <img alt="Python" src="https://img.shields.io/pypi/pyversions/pandas?label=python&logo=python" />
-  <img alt="AsyncIO" src="https://img.shields.io/badge/Framework-AsyncIO-informational" />
-  <img alt="Playwright" src="https://img.shields.io/badge/Login-Playwright-blue" />
-  <img alt="Status" src="https://img.shields.io/badge/Status-Stable-success" />
-  <img alt="License" src="https://img.shields.io/github/license/A11ksa/API-Quotex?style=flat-square" />
+  <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/pypi/pyversions/pandas?label=python&logo=python" /></a>
+  <a href="https://docs.python.org/3/library/asyncio.html"><img alt="AsyncIO" src="https://img.shields.io/badge/Framework-AsyncIO-informational" /></a>
+  <a href="https://playwright.dev/"><img alt="Playwright" src="https://img.shields.io/badge/Login-Playwright-blue" /></a>
+  <a href="https://github.com/A11ksa/API-Quotex/actions"><img alt="Status" src="https://img.shields.io/badge/Status-Stable-success" /></a>
+  <a href="https://github.com/A11ksa/API-Quotex/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/A11ksa/API-Quotex?style=flat-square" /></a>
 </p>
 
 </div>
@@ -34,6 +34,7 @@
 - [Examples](#examples)
 - [Sessions & SSID](#sessions--ssid)
 - [Troubleshooting](#troubleshooting)
+- [Contact](#-contact)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -164,6 +165,21 @@ print(status, profit)
 - **SSL errors?** Ensure your Python/OpenSSL environment is clean
 
 > Tip: Logs are written as `log-YYYY-MM-DD.txt`. Attach them when opening GitHub issues.
+
+---
+
+## 📬 Contact
+<p align="left">
+  <a href="mailto:ar123ksa@gmail.com">
+    <img alt="Email" src="https://img.shields.io/badge/Email-ar123ksa%40gmail.com-EA4335?logo=gmail" />
+  </a>
+  <a href="https://t.me/A11ksa">
+    <img alt="Telegram" src="https://img.shields.io/badge/Telegram-@A11ksa-26A5E4?logo=telegram" />
+  </a>
+</p>
+
+* **Author:** Ahmed (<a href="mailto:ar123ksa@gmail.com">ar123ksa@gmail.com</a>)
+* **Telegram:** <a href="https://t.me/A11ksa">@A11ksa</a>
 
 ---
 
