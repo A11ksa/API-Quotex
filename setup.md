@@ -3,10 +3,10 @@
 > **Purpose:** A polished, one-stop setup guide for installing **API-Quotex**, enabling **Playwright**-based login (SSID extraction), and running your first test.
 
 <p align="center">
-  <img alt="AsyncIO" src="https://img.shields.io/badge/Framework-AsyncIO-informational" />
-  <img alt="Playwright" src="https://img.shields.io/badge/Login-Playwright-blue" />
-  <img alt="Status" src="https://img.shields.io/badge/Status-Stable-success" />
-  <img alt="License" src="https://img.shields.io/github/license/A11ksa/API-Quotex" />
+  <a href="https://github.com/A11ksa/API-Quotex"><img alt="AsyncIO" src="https://img.shields.io/badge/Framework-AsyncIO-informational" /></a>
+  <a href="https://github.com/A11ksa/API-Quotex"><img alt="Playwright" src="https://img.shields.io/badge/Login-Playwright-blue" /></a>
+  <a href="https://github.com/A11ksa/API-Quotex"><img alt="Status" src="https://img.shields.io/badge/Status-Stable-success" /></a>
+  <a href="https://github.com/A11ksa/API-Quotex/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/A11ksa/API-Quotex" /></a>
 </p>
 
 ---
@@ -84,6 +84,21 @@ What you should see: **connect → account → assets → (optional) order → r
 - **Login fails / SSID expired:** delete `sessions/session.json` and sign in again
 - **WebSocket region issues:** adjust region settings in your config
 - **SSL / cert warnings:** re-check your Python and OpenSSL runtime
+
+---
+
+## 📬 Contact
+<p align="left">
+  <a href="mailto:ar123ksa@gmail.com">
+    <img alt="Email" src="https://img.shields.io/badge/Email-ar123ksa%40gmail.com-EA4335?logo=gmail" />
+  </a>
+  <a href="https://t.me/A11ksa">
+    <img alt="Telegram" src="https://img.shields.io/badge/Telegram-@A11ksa-26A5E4?logo=telegram" />
+  </a>
+</p>
+
+* **Author:** Ahmed (<a href="mailto:ar123ksa@gmail.com">ar123ksa@gmail.com</a>)
+* **Telegram:** <a href="https://t.me/A11ksa">@A11ksa</a>
 
 ---
 
