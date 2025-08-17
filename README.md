@@ -1,31 +1,45 @@
 <div align="center">
-  <h1>API-Quotex – Python Async WebSocket Client</h1>
-  <p><b>⚡ Professional, fully asynchronous trading API for the Quotex broker ⚡</b></p>
-  <p>
-    <img src="https://img.shields.io/pypi/pyversions/pandas?label=python&logo=python" />
-    <img src="https://img.shields.io/github/license/A11ksa/API-Quotex?style=flat-square" />
-    <img src="https://img.shields.io/badge/async-supported-brightgreen?logo=python" />
-    <img src="https://img.shields.io/badge/login-Playwright-blue" />
-    <img src="https://img.shields.io/badge/status-stable-success?logo=github"/>
-  </p>
+
+<h1>🚀 API-Quotex – Async WebSocket Client for Quotex</h1>
+
+<p><b>High-performance, production-ready Python client with <u>Playwright</u> login (SSID) & full trade lifecycle.</b></p>
+
+<p>
+  <img alt="Python" src="https://img.shields.io/pypi/pyversions/pandas?label=python&logo=python" />
+  <img alt="AsyncIO" src="https://img.shields.io/badge/Framework-AsyncIO-informational" />
+  <img alt="Playwright" src="https://img.shields.io/badge/Login-Playwright-blue" />
+  <img alt="Status" src="https://img.shields.io/badge/Status-Stable-success" />
+  <img alt="License" src="https://img.shields.io/github/license/A11ksa/API-Quotex?style=flat-square" />
+</p>
+
 </div>
 
 ---
 
-## Overview
-**API-Quotex** is a production-grade, fully asynchronous WebSocket client for the **Quotex** broker. It powers high-frequency trading bots, research tools, and automation.
+## ✨ Features
+- ⚡ **Async**: non-blocking WebSocket client optimized for realtime data
+- 🔐 **Playwright Login**: automated SSID extraction & reuse (demo/live)
+- 📈 **Market Data**: assets, payouts, quotes, and real-time candles
+- 🧾 **Orders**: open, track, and resolve full trade lifecycle (WIN/LOSS/DRAW)
+- 🩺 **Monitoring**: structured logging & health checks
+- 🧪 **Examples**: quick-start scripts for connection, candles, and orders
 
-**Highlights**
-- Live & Demo trading
-- Real-time candles, quotes, and assets/payouts
-- Full trade lifecycle (place, track, result)
-- **Automated login and SSID management via Playwright**
-- Comprehensive logging & health monitoring
+---
+
+## 🧭 Table of Contents
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Why Playwright?](#why-playwright)
+- [Architecture](#architecture)
+- [Examples](#examples)
+- [Sessions & SSID](#sessions--ssid)
+- [Troubleshooting](#troubleshooting)
+- [Contributing](#contributing)
+- [License](#license)
 
 ---
 
 ## Installation
-
 ```bash
 git clone https://github.com/A11ksa/API-Quotex
 cd API-Quotex
@@ -33,7 +47,7 @@ python -m venv venv
 # Linux/macOS:
 source venv/bin/activate
 # Windows:
-venv\Scriptsctivate
+venv\Scripts\activate
 pip install -U pip
 pip install .
 python -m playwright install chromium
@@ -42,36 +56,38 @@ python -m playwright install chromium
 ---
 
 ## Quick Start
-
 ```python
 import asyncio
 from api_quotex import AsyncQuotexClient, OrderDirection, get_ssid
 
 async def main():
-    # Extract (or reuse) SSID via Playwright-based login
-    # If a valid sessions/session.json exists, it will be reused by your login helper.
+    # 1) Get / refresh SSID via Playwright helper (opens browser on first run)
     ssid_info = get_ssid(email="you@example.com", password="YourPassword")
-    demo_ssid = ssid_info.get("demo")  # or "live" for real account
+    demo_ssid = ssid_info.get("demo")  # or "live"
 
+    # 2) Connect
     client = AsyncQuotexClient(ssid=demo_ssid, is_demo=True)
-    connected = await client.connect()
-    if not connected:
+    if not await client.connect():
         print("Failed to connect")
         return
 
-    balance = await client.get_balance()
-    print(f"Balance: {balance.balance} {balance.currency}")
+    # 3) Balance
+    bal = await client.get_balance()
+    print(f"Balance: {bal.balance} {bal.currency}")
 
-    # Place a 60s CALL order (example)
+    # 4) Place order (60s CALL example)
     order = await client.place_order(
         asset="AUDCAD_otc",
         amount=5.0,
         direction=OrderDirection.CALL,
         duration=60
     )
+
+    # 5) Await result
     profit, status = await client.check_win(order.order_id)
     print("Result:", status, "Profit:", profit)
 
+    # 6) Disconnect
     await client.disconnect()
 
 if __name__ == "__main__":
@@ -80,34 +96,89 @@ if __name__ == "__main__":
 
 ---
 
-## Sessions & SSID
-- First run performs login (Playwright) and saves `sessions/session.json`.
-- Subsequent runs reuse `session.json` until it expires; then login is refreshed.
+## Why Playwright?
+- ✅ Maintains parity with browser behavior (anti-bot friendly)
+- ✅ Simplifies cookie/session extraction (SSID)
+- ✅ Robust to UX changes vs brittle HTTP scraping
+- ✅ Easy to refresh sessions and switch demo/live
 
 ---
 
-## Logging & Monitoring
-- Daily logs: `log-YYYY-MM-DD.txt`
-- Advanced error categorization and health checks are available in `api_quotex/monitoring.py`.
+## Architecture
+```
++---------------------+
+|  Playwright Helper  |  (Login UI)
+|  - opens browser    |--> SSID saved to sessions/session.json
++----------+----------+
+           |
+           v
++---------------------+      WebSocket (AsyncIO)
+|  AsyncQuotexClient  |<-------------------------------> Quotex WS
+|  - connect          |       - quotes, candles, orders
+|  - assets/payouts   |
+|  - place/check      |
++---------------------+
+```
+
+---
+
+## Examples
+
+### Stream latest candles for an asset
+```python
+# Pseudocode outline; see your client for exact APIs
+await client.subscribe_candles(asset="EURUSD_otc", timeframe=60)
+async for candle in client.iter_candles("EURUSD_otc", 60):
+    print(candle.time, candle.open, candle.close)
+```
+
+### Place PUT order and check result
+```python
+order = await client.place_order(
+    asset="EURUSD_otc",
+    amount=10.0,
+    direction=OrderDirection.PUT,
+    duration=60
+)
+profit, status = await client.check_win(order.order_id)
+print(status, profit)
+```
+
+---
+
+## Sessions & SSID
+- First run opens Chromium and stores **SSID** in `sessions/session.json`
+- Subsequent runs reuse it until expiry (then it auto-refreshes via login)
+
+**Manual override**
+```json
+{"live": "SSID_LIVE", "demo": "SSID_DEMO"}
+```
 
 ---
 
 ## Troubleshooting
-- **Browser missing:** `python -m playwright install chromium`
-- **Auth error:** delete `sessions/session.json` and re-login
-- **Order not placed:** ensure asset is open & balance sufficient
-- **WebSocket issues:** verify region/connection in your configuration
+- **No browser installed?** `python -m playwright install chromium`
+- **Auth error?** Delete `sessions/session.json` and retry login
+- **No data / timeouts?** Check region, network, and broker status
+- **SSL errors?** Ensure your Python/OpenSSL environment is clean
+
+> Tip: Logs are written as `log-YYYY-MM-DD.txt`. Attach them when opening GitHub issues.
 
 ---
 
 ## Contributing
-PRs welcome. Please open issues first for large changes and keep style consistent (PEP 8).
+PRs are welcome. Please:
+1. Open an issue describing the change
+2. Keep style consistent (PEP 8 + type hints)
+3. Add tests where meaningful
+
+---
 
 ## License
 MIT — see `LICENSE`.
 
-## Contact
-Author: Ahmed — ar123ksa@gmail.com • Telegram: @A11ksa
+---
 
-## Disclaimer
-This library is for educational/research purposes only. Trading involves risk. Use at your own discretion.
+## Acknowledgments
+Thanks to the community for continued feedback and to the maintainers for the Playwright + AsyncIO integration.
