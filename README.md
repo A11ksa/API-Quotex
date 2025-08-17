@@ -152,8 +152,12 @@ print(status, profit)
 - Subsequent runs reuse it until expiry (then it auto-refreshes via login)
 
 **Manual override**
+
 ```json
-{"live": "SSID_LIVE", "demo": "SSID_DEMO"}
+{
+    "live": "42["authorization",{"session":"A8i6rBIfrfrfUYD9BkfGKv00000akJkSeouX73q","isDemo":0,"tournamentId":0}]",
+    "demo": "42["authorization",{"session":"A8i6rBIfrfrfUYD9BkfGKv00000akJkSeouX73q","isDemo":1,"tournamentId":0}]"
+}
 ```
 
 ---
