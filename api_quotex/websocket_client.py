@@ -427,6 +427,123 @@ class AsyncWebSocketClient:
             else:
                 continue
 
+        return False
+
+    async def _send_handshake(self, ssid: str) -> None:
+        try:
+            logger.debug("Waiting for Engine.IO open and Socket.IO connect ('40')...")
+            ok = await self._recv_until_sioconnect(timeout=CONNECTION_SETTINGS.get("handshake_timeout", 10.0))
+            if not ok:
+                raise WebSocketError("Handshake timeout (no '40' connect frame)")
+
+            await self.send_message(ssid)
+            logger.debug(f"Sent authorization message: {ssid}")
+
+            auth_response = await asyncio.wait_for(
+                self.websocket.recv(),
+                timeout=CONNECTION_SETTINGS.get("handshake_timeout", 10.0)
+            )
+            logger.debug(f"Received authentication response: {auth_response}")
+
+            if auth_response.startswith('42["s_authorization"') or auth_response.startswith('451-["instruments/list"'):
+                # success by s_authorization or by server pushing instruments/list header immediately
+                if auth_response.startswith('451-["instruments/list"'):
+                    logger.info("Authentication successful (via instruments/list header)")
+                else:
+                    logger.info("Authentication successful")
+                    # request instruments list explicitly only when not already pushed
+                    await self.send_message('451-["instruments/list",{"_placeholder":true,"num":0}]')
+                    logger.debug("Sent instruments/list request")
+
+                await self._emit_event("authenticated", {})
+
+            else:
+                # Try to parse the frame to check if it's actually an auth reject
+                is_auth_reject = False
+                if auth_response.startswith("42"):
+                    try:
+                        parsed = json.loads(auth_response[2:])
+                        if isinstance(parsed, list) and parsed:
+                            ev = parsed[0]
+                            body = parsed[1] if len(parsed) > 1 else {}
+                            if ev in ("authorization/reject", "error") and ("NotAuthorized" in str(body) or "authorization/reject" in str(ev)):
+                                is_auth_reject = True
+                    except Exception:
+                        pass
+
+                if is_auth_reject:
+                    logger.error("Authentication failed: Invalid SSID")
+                    self._last_auth_error = {"message": "Invalid SSID"}
+                    await self._emit_event("auth_error", self._last_auth_error)
+                    await error_monitor.record_error(
+                        error_type="websocket_auth_failed",
+                        severity=ErrorSeverity.CRITICAL,
+                        category=ErrorCategory.AUTHENTICATION,
+                        message="Authentication failed: Invalid SSID",
+                        context={"response": auth_response[:100]}
+                    )
+                    raise WebSocketError("Authentication failed: Invalid SSID")
+
+                logger.error("Unexpected authentication response")
+                raise WebSocketError("Unexpected authentication response")
+
+            logger.debug("Handshake sequence completed")
+
+        except asyncio.TimeoutError:
+            logger.error("Handshake timeout: server did not respond as expected")
+            self.websocket_is_connected = False
+            await error_monitor.record_error(
+                error_type="websocket_handshake_timeout",
+                severity=ErrorSeverity.HIGH,
+                category=ErrorCategory.CONNECTION,
+                message="Handshake timeout during connection",
+                context={}
+            )
+            raise WebSocketError("Handshake timeout")
+
+        except Exception as e:
+            logger.error(f"Handshake failed: {str(e)}")
+            self.websocket_is_connected = False
+            await error_monitor.record_error(
+                error_type="websocket_handshake_failed",
+                severity=ErrorSeverity.CRITICAL,
+                category=ErrorCategory.CONNECTION,
+                message=f"Handshake failed: {str(e)}",
+                context={}
+            )
+            raise
+
+    async def _start_background_tasks(self) -> None:
+        self._ping_task = asyncio.create_task(self._ping_loop())
+        self._receiver_task = asyncio.create_task(self.receive_messages())
+
+    async def _ping_loop(self) -> None:
+        while self._running and self.websocket:
+            try:
+                await asyncio.sleep(25)
+                if self.websocket and not self.websocket.closed:
+                    await self.send_message("2")
+                    if self.connection_info:
+                        self.connection_info = ConnectionInfo(
+                            url=self.connection_info.url,
+                            region=self.connection_info.region,
+                            status=self.connection_info.status,
+                            connected_at=self.connection_info.connected_at,
+                            last_ping=datetime.now(),
+                            reconnect_attempts=self.connection_info.reconnect_attempts,
+                        )
+            except Exception as e:
+                logger.error(f"Ping loop error: {str(e)}")
+                self.websocket_is_connected = False
+                await error_monitor.record_error(
+                    error_type="websocket_ping_failed",
+                    severity=ErrorSeverity.MEDIUM,
+                    category=ErrorCategory.CONNECTION,
+                    message=f"Ping loop error: {str(e)}",
+                    context={}
+                )
+                break
+
     async def _process_message(self, message: Union[str, bytes]) -> None:
         """Process incoming WebSocket messages with enhanced event handling (handles PONG '3')."""
         try:
@@ -932,5 +1049,3 @@ class AsyncWebSocketClient:
                 return "LIVE"
         except Exception:
             return "UNKNOWN"
-
-        return False
