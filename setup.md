@@ -73,7 +73,7 @@ API-Quotex/
 
 ## 🧪 Smoke Test
 ```bash
-python test4.py
+python test1.py
 ```
 What you should see: **connect → account → assets → (optional) order → result**.
 
