@@ -29,7 +29,7 @@ def _now_ms() -> int:
 
 class MessageBatcher:
     """Batch outgoing messages to reduce WebSocket send calls under high load."""
-    def __init__(self, batch_size: int = 10, batch_timeout: float = 0.1):
+    def __init__(self, batch_size: int = 10, batch_timeout: float = 0.03):
         self.batch_size = batch_size
         self.batch_timeout = batch_timeout
         self.pending_messages: deque = deque()
@@ -885,107 +885,72 @@ class AsyncWebSocketClient:
                 context={}
             )
 
-    async def _handle_json_message(self, data: List[Any]) -> None:
-        """Handle JSON messages with comprehensive event detection."""
-        if not data or len(data) < 1:
-            logger.debug("Empty JSON message received")
-            return
-
-        event_type = data[0]
-        event_data = data[1] if len(data) > 1 else {}
-
-        logger.debug(f"Processing JSON event: {event_type}")
-
-        if event_type == "s_authorization":
-            await self._emit_event("authenticated", event_data)
-            self.websocket_is_connected = True
-            self.ssl_mutual_exclusion = False
-            await self.send_message('451-["instruments/list",{"_placeholder":true,"num":0}]')
-            logger.debug("Sent instruments/list request after s_authorization")
-
-        elif event_type == "successauth":
-            await self._emit_event("authenticated", event_data)
-            self.websocket_is_connected = True
-            self.ssl_mutual_exclusion = False
-            await self.send_message('451-["instruments/list",{"_placeholder":true,"num":0}]')
-            logger.debug("Sent instruments/list request after authentication")
-
-        elif event_type == "successupdateBalance":
-            await self._emit_event("balance_updated", event_data)
-
-        elif event_type == "s_balance":
-            await self._emit_event("balance_data", event_data)
-
-        elif event_type == "s_balance/list":
-            await self._emit_event("balance_list", event_data)
-            logger.info("Received balance list data")
-
-        elif event_type == "settings/list":
-            await self._emit_event("settings_list", event_data)
-            logger.info("Received settings list data")
-
-        elif event_type == "orders/opened/list":
-            await self._emit_event("orders_opened_list", event_data)
-            logger.info("Received opened orders list")
-
-        elif event_type == "s_drawing/load":
-            await self._emit_event("drawing_load", event_data)
-            logger.info("Received drawing load data")
-
-        elif event_type == "orders/closed/list":
-            await self._emit_event("orders_closed_list", event_data)
-            logger.info("Received closed orders list")
-
-        elif event_type == "successopenOrder":
-            await self._emit_event("order_opened", event_data)
-
-        elif event_type == "successcloseOrder":
-            await self._emit_event("order_closed", event_data)
-
-        elif event_type == "updateStream":
-            await self._emit_event("stream_update", event_data)
-
-        elif event_type == "loadHistoryPeriod":
-            await self._emit_event("candles_received", event_data)
-
-        elif event_type == "updateHistoryNew":
-            await self._emit_event("history_update", event_data)
-
-        elif event_type == "instruments/list":
-            await self._emit_event("assets_list", event_data)
-
-        elif event_type == "quotes/stream":
-            await self._emit_event("quote_stream", event_data)
-
-        elif event_type == "depth/change":
-            await self._emit_event("depth_change", event_data)
-
-        elif event_type == "error":
-            if "authorization/reject" in str(event_data):
-                self._last_auth_error = {"message": "Authorization rejected by server"}
-                await self._emit_event("auth_error", self._last_auth_error)
-                await error_monitor.record_error(
-                    error_type="websocket_auth_failed",
-                    severity=ErrorSeverity.CRITICAL,
-                    category=ErrorCategory.AUTHENTICATION,
-                    message="Authentication failed: Authorization rejected",
-                    context={"event_data": str(event_data)[:100]}
-                )
+    async def _handle_candle_message(self, message: str) -> None:
+        """
+        Fast/low-overhead handling for Engine.IO binary frames ('\x04' + JSON).
+        Supports:
+          - Headered flow: 451-["event", {"_placeholder":true}]  then \x04{...}
+          - Headerless flow: directly \x04{...} or \x04[...]
+        Dispatches immediately with minimal logging for sub-100ms paths.
+        """
+        try:
+            if not message.startswith("\x04"):
+                return
+            payload = json.loads(message[1:])  # strip ETX
+            # If no pending header, infer and dispatch quickly (Pocket Option-like)
+            if not self._pending_binary_event:
+                inferred = self._event_headerless_payload(payload)
+                # Direct emit with no extra allocations/log noise
+                await self._emit_event(inferred, payload)
+                return
+            # We have a pending 451 header → route deterministically
+            event_name = self._pending_binary_event
+            self._pending_binary_event = None
+            if event_name == "s_balance":
+                await self._emit_event("balance_data", payload)
+            elif event_name == "s_orders/open":
+                await self._emit_event("order_opened", payload)
+            elif event_name == "s_orders/close":
+                deals = (payload or {}).get("deals") or []
+                if isinstance(deals, list):
+                    for d in deals:
+                        await self._emit_event("order_closed", d)
+                else:
+                    ticket = (payload or {}).get("ticket")
+                    if isinstance(ticket, dict):
+                        await self._emit_event("order_closed", ticket)
+            elif event_name == "orders/closed/list":
+                await self._emit_event("orders_closed_list", payload if isinstance(payload, list) else [])
+            elif event_name == "instruments/list":
+                await self._emit_event("assets_list", payload)
+            elif event_name == "quotes/stream":
+                await self._emit_event("quote_stream", payload)
+            elif event_name == "history/list/v2":
+                await self._emit_event("candles_received", payload)
+            elif event_name == "chart_notification/get":
+                await self._emit_event("candles_received", payload)
             else:
-                await self._emit_event("error", event_data)
-                await error_monitor.record_error(
-                    error_type=f"websocket_server_error_{event_data.get('error', 'unknown')}",
-                    severity=ErrorSeverity.HIGH,
-                    category=ErrorCategory.DATA,
-                    message=f"Server error: {event_data}",
-                    context={"event_data": str(event_data)[:100]}
-                )
-        else:
-            logger.warning(f"Unknown JSON event type: {event_type}")
-            await self._emit_event("unknown_event", {"type": event_type, "data": event_data})
+                await self._emit_event("json_data", {"event": event_name, "data": payload})
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error for binary payload: {e}")
+            await error_monitor.record_error(
+                error_type="binary_json_decode_error",
+                severity=ErrorSeverity.MEDIUM,
+                category=ErrorCategory.DATA,
+                message=f"JSON decode error for binary payload: {str(e)}",
+                context={}
+            )
+        except Exception as e:
+            logger.error(f"Error handling binary payload: {e}")
+            await error_monitor.record_error(
+                error_type="binary_payload_error",
+                severity=ErrorSeverity.HIGH,
+                category=ErrorCategory.DATA,
+                message=f"Error handling binary payload: {str(e)}",
+                context={}
+            )
 
     async def _emit_event(self, event: str, data: Any) -> None:
-        logger.info(f"Dispatching event: {event}, data={str(data)[:200]}")
         handlers = self._event_handlers.get(event, [])
         for cb in handlers:
             try:
