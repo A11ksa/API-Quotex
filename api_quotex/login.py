@@ -236,7 +236,39 @@ async def _playwright_login_and_capture(email: str, password: str, lang: str, is
                 await browser.close()
             except Exception:
                 pass
-                
+
+# Cloudscraper helpers
+def _extract_csrf_from_signin(html: str) -> Optional[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    login_form = soup.select_one('#tab-1 form[action$="/sign-in/"]')
+    if login_form:
+        hidden = login_form.select_one('input[name="_token"]')
+        if hidden and hidden.get("value"):
+            return hidden["value"]
+    m = re.search(r"window\.settings\s*=\s*(\{.*?\})", html, re.S)
+    if m:
+        try:
+            w = json.loads(m.group(1))
+            return w.get("csrf")
+        except Exception:
+            return None
+    return None
+
+def _extract_token_from_trade(html: str) -> Optional[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    scripts = soup.find_all("script")
+    for s in scripts:
+        txt = (s.get_text() or "").strip()
+        if "window.settings" in txt:
+            try:
+                j = re.sub(r"^window\.settings\s*=\s*", "", txt.replace(";", ""))
+                token = json.loads(j).get("token")
+                if token:
+                    return token
+            except Exception:
+                continue
+    return None
+
 # Main entry
 async def get_ssid(email: str = None, password: str = None, email_pass: str = None, lang: str = "en", is_demo: bool = True, keep_browser_on_error: bool = False) -> Tuple[bool, Dict]:
     """
