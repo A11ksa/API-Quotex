@@ -8,7 +8,7 @@ import uuid
 import base64
 from typing import Dict, List, Any, Callable, Optional, Union, Tuple
 from datetime import datetime
-from collections import defaultdict
+from collections import defaultdict, deque
 import pandas as pd
 from loguru import logger
 
@@ -27,9 +27,56 @@ logger.remove()
 log_filename = f"log-{time.strftime('%Y-%m-%d')}.txt"
 logger.add(log_filename, level="INFO", encoding="utf-8", backtrace=True, diagnose=True)
 
+# Fast path: ultra-low-latency candle store
+class FastCandleStore:
+    """Lock-free ring buffer per (asset, period) for near-instant candle reads."""
+    def __init__(self, maxlen: int = 4096):
+        self._bufs: Dict[Tuple[str, int], deque] = {}
+        self._last_ts: Dict[Tuple[str, int], int] = {}
+        self._maxlen = maxlen
+
+    def _key(self, asset: str, period: int) -> Tuple[str, int]:
+        return (asset, int(period))
+
+    def add_many(self, asset: str, period: int, candles: List["Candle"]) -> None:
+        if not candles:
+            return
+        k = self._key(asset, period)
+        buf = self._bufs.get(k)
+        if buf is None:
+            buf = deque(maxlen=self._maxlen)
+            self._bufs[k] = buf
+
+        # De-duplicate while preserving order (oldest -> newest)
+        last_ts = self._last_ts.get(k, 0)
+        appended_any = False
+        for c in sorted(candles, key=lambda x: x.timestamp):
+            ts_i = int(c.timestamp.timestamp())
+            if ts_i <= last_ts:
+                continue
+            buf.append(c)
+            last_ts = ts_i
+            appended_any = True
+
+        if appended_any:
+            self._last_ts[k] = last_ts
+
+    def get_tail(self, asset: str, period: int, count: int) -> List["Candle"]:
+        k = self._key(asset, period)
+        buf = self._bufs.get(k)
+        if not buf:
+            return []
+        if count <= 0 or count >= len(buf):
+            return list(buf)
+        return list(buf)[-count:]
+
+    def size(self, asset: str, period: int) -> int:
+        k = self._key(asset, period)
+        buf = self._bufs.get(k)
+        return len(buf) if buf else 0
+
 class AsyncQuotexClient:
     """Professional async Quotex client with modern Python practices"""
-
     # region Initialization and Setup
     def __init__(self, ssid: str, is_demo: bool = True, uid: int = 0, region: Optional[str] = None,
                  is_fast_history: bool = True, persistent_connection: bool = False, auto_reconnect: bool = True,
@@ -98,10 +145,14 @@ class AsyncQuotexClient:
             "messages_received": 0,
             "connection_start_time": None,
         }
+        # Fast store for instant candle reads
+        self._fast_store = FastCandleStore()
+
         logger.info(
             f"Initialized Quotex client (demo={is_demo}, persistent={persistent_connection}) with enhanced monitoring"
             if enable_logging else ""
         )
+
     def _setup_event_handlers(self):
         self._websocket.add_event_handler('authenticated', self._on_authenticated)
         self._websocket.add_event_handler('s_authorization', self._on_authenticated)
@@ -233,30 +284,23 @@ class AsyncQuotexClient:
 
     async def _start_persistent_connection(self, regions: Optional[List[str]] = None) -> bool:
         logger.info("Starting persistent connection with automatic keep-alive...")
-
         from .connection_keep_alive import ConnectionKeepAlive
         complete_ssid = self.raw_ssid
         self._keep_alive_manager = ConnectionKeepAlive(complete_ssid, self.is_demo)
-
         self._keep_alive_manager.add_event_handler('connected', self._on_keep_alive_connected)
         self._keep_alive_manager.add_event_handler('reconnected', self._on_keep_alive_reconnected)
         self._keep_alive_manager.add_event_handler('message_received', self._on_keep_alive_message)
-
         self._keep_alive_manager.add_event_handler('balance_data', self._on_balance_data)
         self._keep_alive_manager.add_event_handler('balance_updated', self._on_balance_updated)
         self._keep_alive_manager.add_event_handler('authenticated', self._on_authenticated)
-
         self._keep_alive_manager.add_event_handler('order_opened', self._on_order_opened)
         self._keep_alive_manager.add_event_handler('order_closed', self._on_order_closed)
-
         self._keep_alive_manager.add_event_handler('candles_received', self._on_candles_received)
         self._keep_alive_manager.add_event_handler('assets_list', self._on_assets_updated)
         self._keep_alive_manager.add_event_handler('quote_stream', self._on_quote_stream)
         self._keep_alive_manager.add_event_handler('depth_change', self._on_depth_change)
-
         self._keep_alive_manager.add_event_handler('error', self._on_error)
         self._keep_alive_manager.add_event_handler('auth_error', self._on_auth_error)
-
         success = await self._keep_alive_manager.connect_with_keep_alive(regions)
         if success:
             self._is_persistent = True
@@ -666,15 +710,18 @@ class AsyncQuotexClient:
                 await asyncio.sleep(1)
 
     async def get_assets_and_payouts(self) -> Dict[str, int]:
+        """
+        Fast path: use the latest instruments snapshot (kept in _assets_data) when available,
+        otherwise pull a fresh snapshot via _get_raw_asset(). Only open assets with positive payout are returned.
+        """
         if not self.is_connected:
             raise ConnectionError("Not connected to Quotex")
 
-        while True:
-            try:
-                assets = await self.get_available_assets()
+        try:
+            # Prefer cached snapshot if present
+            if getattr(self, "_assets_data", None):
                 payouts: Dict[str, int] = {}
-
-                for symbol, info in assets.items():
+                for symbol, info in self._assets_data.items():
                     try:
                         payout = int(info.get("payout", 0) or 0)
                         is_open = bool(info.get("is_open", False))
@@ -682,17 +729,51 @@ class AsyncQuotexClient:
                             payouts[sanitize_symbol(symbol)] = payout
                     except Exception:
                         continue
-
                 return payouts
-            except Exception:
-                await asyncio.sleep(1)
+
+            # Fallback: pull fresh snapshot
+            raw_assets = await self._get_raw_asset()
+            payouts: Dict[str, int] = {}
+            for row in raw_assets or []:
+                try:
+                    symbol = str(row[1])
+                    payout = int(row[5]) if len(row) > 5 and row[5] is not None else 0
+                    is_open = bool(row[14]) if len(row) > 14 and row[14] is not None else False
+                    if "_OTC" in symbol:
+                        symbol = symbol.replace("_OTC", "_otc")
+                    if is_open and payout > 0:
+                        payouts[sanitize_symbol(symbol)] = payout
+                except Exception:
+                    continue
+            return payouts
+
+        except Exception:
+            await asyncio.sleep(1)
+            return {}
 
     async def get_payout(self, asset: str, timeframe: str) -> float:
+        """
+        Pocket-Option style speed: answer from instruments snapshot first (source of truth),
+        then fallback to a direct instruments/list pull if stale/missing.
+        """
         if asset not in ASSETS:
             raise InvalidParameterError(f"Invalid asset: {asset}")
         if timeframe not in TIMEFRAMES:
             raise InvalidParameterError(f"Invalid timeframe: {timeframe}")
 
+        # Fast snapshot path
+        if getattr(self, "_assets_data", None):
+            info = self._assets_data.get(asset) or self._assets_data.get(sanitize_symbol(asset))
+            if info:
+                if not info.get("is_open", False):
+                    logger.warning(f"Asset {asset} is closed")
+                    return 0.0
+                try:
+                    return float(int(info.get("payout", 0) or 0))
+                except Exception:
+                    pass
+
+        # Fallback to raw pull (keeps original logic)
         while True:
             try:
                 raw_assets = await self._get_raw_asset()
@@ -872,20 +953,17 @@ class AsyncQuotexClient:
 
     # region Candle Management
     async def request_chart_notifications(self, asset: str, version: str = "1.0.0") -> None:
+        """
+        Idempotent request of chart notifications (server pushes live/history deltas).
+        Safe to call multiple times; extremely cheap and improves first-plot latency.
+        """
         try:
-            sanitized = sanitize_symbol(asset)
-            if "_OTC" in sanitized:
-                sanitized = sanitized.replace("_OTC", "_otc")
-
-            message = f'42["chart_notification/get",{{"asset":"{sanitized}","version":"{version}"}}]'
+            sanitized = sanitize_symbol(asset).replace("_OTC", "_otc")
+            msg = f'42["chart_notification/get",{{"asset":"{sanitized}","version":"{version}"}}]'
             if self._is_persistent and self._keep_alive_manager:
-                await self._keep_alive_manager.send_message(message)
+                await self._keep_alive_manager.send_message(msg)
             else:
-                await self._websocket.send_message(message)
-
-            if self.enable_logging:
-                logger.debug(f"Requested chart notifications for asset: {sanitized}")
-
+                await self._websocket.send_message(msg)
         except Exception as e:
             logger.error(f"Failed to request chart notifications: {str(e)}")
             await self._error_monitor.record_error(
@@ -896,132 +974,145 @@ class AsyncQuotexClient:
                 context={"asset": asset, "version": version}
             )
 
-    async def get_candles(self, asset: str, timeframe: Union[str, int], count: int = 100, end_time: Optional[datetime] = None) -> List[Candle]:
-        timeframe_seconds = TIMEFRAMES.get(timeframe, 60) if isinstance(timeframe, str) else int(timeframe)
-        sanitized = sanitize_symbol(asset)
-        if "_OTC" in sanitized:
-            sanitized = sanitized.replace("_OTC", "_otc")
+    async def get_candles(self, asset: str, timeframe: Union[str, int], count: int = 100,
+                          end_time: Optional[datetime] = None) -> List["Candle"]:
+        """
+        1) Serve immediately from FastCandleStore if enough data is already cached.
+        2) Otherwise fire a single consolidated request and merge the response into the store.
+        """
+        tf_secs = TIMEFRAMES.get(timeframe, 60) if isinstance(timeframe, str) else int(timeframe)
+        sym = sanitize_symbol(asset).replace("_OTC", "_otc")
 
-        logger.debug(f"Requesting up to {count} candles for asset: {sanitized}, timeframe: {timeframe_seconds}s")
+        # Lazy-init fast store
+        if not hasattr(self, "_fast_store"):
+            self._fast_store = FastCandleStore()
+
+        # Instant answer if we already have enough candles cached
+        cached_n = self._fast_store.size(sym, tf_secs)
+        if cached_n >= max(1, count):
+            return self._fast_store.get_tail(sym, tf_secs, count)
+
+        # Not enough in cache → fetch and then merge
         try:
-            candles = await self._request_candles(sanitized, timeframe_seconds, count, end_time)
-            if not candles:
-                logger.warning(f"No candles returned for {sanitized}")
-                return []
-
-            self._candles_cache[f"{sanitized}_{timeframe_seconds}"] = candles
-            logger.info(f"Retrieved {len(candles)} candles for {sanitized}")
-            return candles
-
-        except InvalidParameterError:
-            logger.warning(f"Invalid asset: {asset} (sanitized to {sanitized})")
-            return []
+            candles = await self._request_candles(sym, tf_secs, count, end_time)
+            if candles:
+                self._fast_store.add_many(sym, tf_secs, candles)
+                # Also keep old cache for backward compatibility (if anything else uses it)
+                self._candles_cache[f"{sym}_{tf_secs}"] = self._fast_store.get_tail(sym, tf_secs, 999_999)
+            return self._fast_store.get_tail(sym, tf_secs, count)
         except Exception as e:
-            logger.error(f"Error fetching candles for {sanitized}: {e}")
+            logger.error(f"Error fetching candles for {sym}: {e}")
             return []
 
-    async def get_candles_dataframe(self, asset: str, timeframe: Union[str, int], count: int = 100, end_time: Optional[datetime] = None) -> pd.DataFrame:
+    async def get_candles_dataframe(self, asset: str, timeframe: Union[str, int],
+                                    count: int = 100, end_time: Optional[datetime] = None) -> pd.DataFrame:
         candles = await self.get_candles(asset, timeframe, count, end_time)
+        if not candles:
+            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
         rows = [{
             "timestamp": c.timestamp,
-            "open": c.open,
-            "high": c.high,
-            "low": c.low,
-            "close": c.close,
-            "volume": c.volume
+            "open": c.open, "high": c.high, "low": c.low, "close": c.close, "volume": c.volume
         } for c in candles]
-
         df = pd.DataFrame(rows)
-        if not df.empty:
-            df.set_index("timestamp", inplace=True)
-            df.sort_index(inplace=True)
+        df.set_index("timestamp", inplace=True)
+        df.sort_index(inplace=True)
         return df
 
-    async def _request_candles(self, asset: str, timeframe: int, count: int, end_time: Optional[datetime]) -> List["Candle"]:
+    async def _request_candles(self, asset: str, timeframe: int, count: int,
+                               end_time: Optional[datetime]) -> List["Candle"]:
+        """
+        Consolidates concurrent requests per (asset,timeframe) and resolves all waiters together.
+        Sends follow/update + chart_notification in one burst. Keeps original behavior & timeouts.
+        """
         request_id = f"{asset}_{timeframe}"
+        # Reuse an in-flight future for the same rid (like Pocket Option)
+        fut = self._candle_requests.get(request_id)
+        if fut and not fut.done():
+            try:
+                return await asyncio.wait_for(fut, timeout=max(10.0, float(getattr(self._config.trading, "default_timeout", 10))))
+            except asyncio.TimeoutError:
+                return []
         candle_future: asyncio.Future = asyncio.get_event_loop().create_future()
         self._candle_requests[request_id] = candle_future
-
         try:
             follow_msg = f'42["instruments/follow","{asset}"]'
             upd_msg = f'42["instruments/update",{{"asset":"{asset}","period":{int(timeframe)}}}]'
-
             if self._is_persistent and self._keep_alive_manager:
                 await self._keep_alive_manager.send_message(follow_msg)
                 await self._keep_alive_manager.send_message(upd_msg)
             else:
                 await self._websocket.send_message(follow_msg)
                 await self._websocket.send_message(upd_msg)
-
             await self.request_chart_notifications(asset)
-
             timeout = max(10.0, float(getattr(self._config.trading, "default_timeout", 10)))
             candles = await asyncio.wait_for(candle_future, timeout=timeout)
             return candles[-count:] if isinstance(candles, list) and count else candles
-
         except asyncio.TimeoutError:
             if self.enable_logging:
                 logger.warning(f"Candle request timed out for {asset} / {timeframe}")
             return []
         finally:
+            # Let _on_candles_received own completion; just cleanup mapping here
             self._candle_requests.pop(request_id, None)
 
     async def _on_candles_received(self, data: Dict[str, Any]) -> None:
+        """
+        Handles both history/list/v2 & chart_notification/get payloads.
+        - Resolves the matching pending future immediately (first packet wins).
+        - Merges into FastCandleStore for instant subsequent reads.
+        """
         try:
-            if self.enable_logging:
-                logger.info(f"Candles received type={type(data)} keys={list(data.keys()) if isinstance(data, dict) else 'n/a'}")
-
             asset = data.get("asset") if isinstance(data, dict) else None
             period = data.get("period") if isinstance(data, dict) else None
-
             candles_raw: List[Any] = []
             if isinstance(data, dict):
-                if "candles" in data and isinstance(data["candles"], list) and data["candles"] and isinstance(data["candles"][0], list):
+                if "candles" in data and isinstance(data["candles"], list):
                     candles_raw = data["candles"]
                 elif "history" in data and isinstance(data["history"], list):
                     candles_raw = data["history"]
-
-            handled = False
-            if asset and period is not None:
-                rid = f"{asset}_{int(period)}"
-                if rid in self._candle_requests:
-                    parsed = self._parse_candles_data(candles_raw, asset, int(period))
-                    self._candle_requests[rid].set_result(parsed)
-                    if self.enable_logging:
-                        logger.info(f"Precise: {len(parsed)} candles for {asset}/{period}")
-                    handled = True
-
-            if not handled and self._candle_requests:
+            parsed: List["Candle"] = []
+            if (asset is not None) and (period is not None):
+                parsed = self._parse_candles_data(candles_raw, asset, int(period))
+                # Merge into fast store
+                if parsed:
+                    if not hasattr(self, "_fast_store"):
+                        self._fast_store = FastCandleStore()
+                    self._fast_store.add_many(asset, int(period), parsed)
+            rid = f"{asset}_{int(period)}"
+            waiter = self._candle_requests.get(rid)
+            if waiter and not waiter.done():
+                waiter.set_result(parsed)
+            else:
+                # Fallback: try resolve the first pending future (rare servers omit asset/period)
                 for rid, fut in list(self._candle_requests.items()):
-                    if not fut.done():
-                        parts = rid.split("_")
-                        if len(parts) >= 2:
-                            req_asset = "_".join(parts[:-1])
-                            req_period = int(parts[-1])
-                            parsed = self._parse_candles_data(candles_raw, req_asset, req_period)
-                            if self.enable_logging:
-                                logger.info(f"Fallback: {len(parsed)} candles for {req_asset}/{req_period}")
-                            fut.set_result(parsed)
-                            handled = True
-                            break
-
-            if not handled:
-                if self.enable_logging:
-                    logger.warning("No matching candle request; resolving all with [].")
-                for rid, fut in list(self._candle_requests.items()):
-                    if not fut.done():
-                        fut.set_result([])
-
+                    if fut.done():
+                        continue
+                    parts = rid.split("_")
+                    if len(parts) >= 2:
+                        req_asset = "_".join(parts[:-1])
+                        req_period = int(parts[-1])
+                        parsed = self._parse_candles_data(candles_raw, req_asset, req_period)
+                        if parsed:
+                            if not hasattr(self, "_fast_store"):
+                                self._fast_store = FastCandleStore()
+                            self._fast_store.add_many(req_asset, req_period, parsed)
+                        fut.set_result(parsed)
+                        break
         except Exception as e:
             if self.enable_logging:
                 logger.error(f"Error in candles handler: {e}")
-            for rid, fut in list(self._candle_requests.items()):
+            # Fail-safe: release all waiters to avoid deadlocks
+            for _, fut in list(self._candle_requests.items()):
                 if not fut.done():
                     fut.set_result([])
         finally:
             await self._emit_event("candles_received", data)
 
     def _parse_candles_data(self, candles_data: List[Any], asset: str, timeframe: int) -> List["Candle"]:
+        """
+        Robust parser for [ts, open, low, high, close, vol?] lists (order seen in DevTools payloads),
+        normalizes high/low and supports optional volume. Keeps original semantics.
+        """
         candles: List["Candle"] = []
         try:
             if isinstance(candles_data, list):
@@ -1029,25 +1120,21 @@ class AsyncQuotexClient:
                     if not (isinstance(row, (list, tuple)) and len(row) >= 5):
                         continue
                     try:
-                        ts = float(row[0])
+                        ts = float(row[0])  # seconds
                         o = float(row[1])
                         raw_low = float(row[2])
                         raw_high = float(row[3])
-
-                        hi = max(raw_high, raw_low)
-                        lo = min(raw_high, raw_low)
-
                         c = float(row[4])
                         vol = float(row[5]) if len(row) > 5 and row[5] is not None else 0.0
-
+                        hi = max(raw_high, raw_low)
+                        lo = min(raw_high, raw_low)
                         candle = Candle(
                             timestamp=datetime.fromtimestamp(ts if ts > 2_000_000_000 else int(ts)),
                             open=o, high=hi, low=lo, close=c, volume=vol,
-                            asset=asset, timeframe=timeframe
+                            asset=asset, timeframe=int(timeframe)
                         )
                         candles.append(candle)
                     except (ValueError, TypeError):
-                        logger.warning(f"Skipping invalid candle data: {row}")
                         continue
         except Exception as e:
             if self.enable_logging:
@@ -1721,6 +1808,13 @@ class AsyncQuotexClient:
         return f'42["authorization",{json.dumps(auth_data)}]'
 
     async def _wait_for_authentication(self, timeout: float = 30.0) -> None:
+
+        # Early exit if handshake already completed before we started waiting
+        try:
+            if getattr(self._websocket, 'is_authenticated', False):
+                return
+        except Exception:
+            pass
         auth_received = False
 
         def on_auth(data):
@@ -1738,12 +1832,23 @@ class AsyncQuotexClient:
         try:
             start_time = time.time()
             while not auth_received and (time.time() - start_time) < timeout:
+                if getattr(self._websocket, 'is_authenticated', False):
+                    break
                 await asyncio.sleep(0.1)
-            if not auth_received:
+            if not auth_received and not getattr(self._websocket, 'is_authenticated', False):
                 raise AuthenticationError("Authentication timeout")
         finally:
             self._websocket.remove_event_handler("authenticated", on_auth)
             self._websocket.remove_event_handler("auth_error", on_auth_error)
+
+    async def _on_auth_reject(self, data: dict) -> None:
+        """Handle explicit authorization rejection by server."""
+        if self.enable_logging:
+            logger.error("Server rejected authorization; closing connection.")
+        try:
+            await self.disconnect()
+        finally:
+            raise QuotexError("Authorization rejected by server")
 
     async def _initialize_data(self) -> None:
         await self._request_balance_update()
