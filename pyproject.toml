@@ -1,120 +1,34 @@
-[build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
-
 [project]
 name = "api_quotex"
-# Pull version from api_quotex.__version__
-dynamic = ["version"]
-description = "Professional Async WebSocket API client for Quotex (with robust session, assets & candles handling)"
-readme = { file = "README.md", content-type = "text/markdown" }
+version = "2.0.0"
+description = "Quotex API for trading automation"
+readme = "README.md"
 requires-python = ">=3.8"
-license = { file = "LICENSE" }
+license = {text = "MIT"}
 authors = [
-  { name = "Ahmed", email = "ar123ksa@gmail.com" }
-]
-keywords = [
-  "quotex", "binary-options", "websocket", "trading-bot", "asyncio", "python"
+    {name = "A11ksa", email = "ar123ksa@gmail.com"},
 ]
 classifiers = [
-  "Development Status :: 5 - Production/Stable",
-  "Intended Audience :: Developers",
-  "License :: OSI Approved :: MIT License",
-  "Programming Language :: Python",
-  "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3 :: Only",
-  "Programming Language :: Python :: 3.8",
-  "Programming Language :: Python :: 3.9",
-  "Programming Language :: Python :: 3.10",
-  "Programming Language :: Python :: 3.11",
-  "Programming Language :: Python :: 3.12",
-  "Topic :: Software Development :: Libraries",
-  "Topic :: Office/Business :: Financial :: Investment",
-  "Typing :: Typed"
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
 ]
-
-# Core runtime dependencies used by the library
 dependencies = [
-  "websockets>=11.0.3",
-  "loguru>=0.7.0",
-  "pydantic>=1.10.0,<2.0.0",
-  "pandas>=1.3.0",
-  "requests>=2.26.0",
-  "selenium>=4.0.0",
-  "webdriver-manager>=3.5.2",
-  "selenium-recaptcha-solver>=1.0.0"
+    "playwright>=1.40.0",
+    "websockets>=12.0",
+    "asyncio-mqtt>=0.12.0",
+    "pydantic>=2.0.0",
+    "requests>=2.31.0",
 ]
 
 [project.optional-dependencies]
-# Useful when running examples / rich UI in test scripts
-cli = [
-  "rich>=13.0.0"
-]
-# Dev tooling & tests
 dev = [
-  "ruff>=0.4.0",
-  "black>=24.0.0",
-  "isort>=5.12.0",
-  "mypy>=1.7.0",
-  "pytest>=7.4.0",
-  "pytest-asyncio>=0.23.0",
-  "types-requests",
-  "types-python-dateutil"
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "pytest>=7.0.0",
 ]
 
 [project.urls]
 Homepage = "https://github.com/A11ksa/API-Quotex"
 Repository = "https://github.com/A11ksa/API-Quotex"
-Issues = "https://github.com/A11ksa/API-Quotex/issues"
-
-# ---------------------------
-# setuptools configuration
-# ---------------------------
-[tool.setuptools]
-# Package root is under "inf/"
-package-dir = { "" = "inf" }
-include-package-data = true
-
-[tool.setuptools.packages.find]
-where = ["inf"]
-include = ["api_quotex*"]
-
-# Read version dynamically from the package __init__.py
-[tool.setuptools.dynamic]
-version = { attr = "api_quotex.__version__" }
-
-# If you ship type hints, keep this so tools detect them
-[tool.setuptools.package-data]
-api_quotex = ["py.typed"]
-
-# ---------------------------
-# Lint/format/type-check (optional but recommended)
-# ---------------------------
-[tool.ruff]
-line-length = 100
-target-version = "py38"
-
-[tool.black]
-line-length = 100
-target-version = ["py38"]
-
-[tool.isort]
-profile = "black"
-line_length = 100
-py_version = 38
-
-[tool.mypy]
-python_version = "3.8"
-warn_unused_configs = true
-ignore_missing_imports = true
-strict_optional = true
-check_untyped_defs = true
-
-# ---------------------------
-# pytest (optional)
-# ---------------------------
-[tool.pytest.ini_options]
-addopts = "-q"
-filterwarnings = [
-  "ignore::DeprecationWarning",
-]
+Documentation = "https://github.com/A11ksa/API-Quotex/blob/main/README.md"
