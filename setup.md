@@ -22,7 +22,7 @@
 - **Python 3.8+** (3.9+ recommended)
 - `pip` and optionally `venv`
 - Playwright browsers (we’ll install Chromium)
-- Network access to `qxbroker.com`
+- Network access to `quotex.com`
 
 ---
 
@@ -47,41 +47,41 @@ pip install .
 python -m playwright install chromium
 ```
 
+## Using uv
+```bash
+uv sync
+uv run python -m playwright install chromium
+uv run python examples/trading_methods.py
+```
+
+The trading example is read-only by default. To explicitly submit its single demo order:
+```bash
+uv run python examples/trading_methods.py --place-demo-order
+```
+
 ---
 
 ## 🔐 Configure Sessions (Playwright)
-- On first use, the library can open a **Playwright** Chromium window to log in at `https://qxbroker.com/en/sign-in`, then extract and save your **SSID** to `sessions/session.json`.
-- Optional **credentials** location: `sessions/config.json`
-
-**Manual SSID (if you already have it):**
-```json
-{
-  "live": "YOUR_LIVE_SSID",
-  "demo": "YOUR_DEMO_SSID"
-}
+Run the standalone helper and sign in manually in the opened browser:
+```bash
+python login.py --mode demo
 ```
 
-**Folder structure (suggested):**
-```
-API-Quotex/
-  sessions/
-    config.json       # {"email":"...", "password":"..."}
-    session.json      # {"live":"...", "demo":"..."}
-```
+Choose `--mode live` to open the live account instead. Demo is the default. After sign-in, the helper navigates to `/en/demo-trade` or `/en/trade` for the selected mode and only saves a session when its route and authorization frame agree. The SSID and its mode are saved to `sessions/session.json`; the SSID is also written to `QUOTEX_SSID` in `.env` for reuse. The `.env` file is ignored by Git and restricted to owner-only permissions when the SSID is saved.
 
 ---
 
 ## 🧪 Smoke Test
 ```bash
-python test1.py
+python demo_smoke.py
 ```
-What you should see: **connect → account → assets → (optional) order → result**.
+This confirms the demo connection, prints the account balance, and submits one `$1` CALL order with a 60-second duration before checking its result. The order can lose up to `$1`. The script refuses to run unless the saved session explicitly confirms demo mode. `test1.py` is a separate network script that submits multiple demo orders.
 
 ---
 
 ## 🧰 Troubleshooting
 - **Playwright browser missing:** `python -m playwright install chromium`
-- **Login fails / SSID expired:** delete `sessions/session.json` and sign in again
+- **Login fails / SSID expired:** remove `QUOTEX_SSID` from `.env` and `sessions/session.json`, then sign in again
 - **WebSocket region issues:** adjust region settings in your config
 - **SSL / cert warnings:** re-check your Python and OpenSSL runtime
 

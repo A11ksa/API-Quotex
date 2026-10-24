@@ -1,5 +1,6 @@
 """Connection Keep-Alive Manager for Quotex API"""
 import asyncio
+import inspect
 import time
 import json
 import base64
@@ -47,7 +48,7 @@ class ConnectionKeepAlive:
     async def _trigger_event_async(self, event: str, data: Dict[str, Any]) -> None:
         try:
             for handler in self._event_handlers.get(event, []):
-                if asyncio.iscoroutinefunction(handler):
+                if inspect.iscoroutinefunction(handler):
                     await handler(data)
                 else:
                     handler(data)
@@ -68,7 +69,7 @@ class ConnectionKeepAlive:
         for handler in self._event_handlers.get(event, []):
             try:
                 data = kwargs.get("data", {})
-                if asyncio.iscoroutinefunction(handler):
+                if inspect.iscoroutinefunction(handler):
                     await self._handle_async_callback(handler, (data,), {})
                 else:
                     handler(data)
@@ -399,6 +400,25 @@ class ConnectionKeepAlive:
                 context={"message": message[:100]}
             )
             raise ConnectionError(f"Failed to send message: {e}")
+
+    async def send_message_immediate(self, message):
+        if not self.is_connected or not self._websocket:
+            raise ConnectionError("Not connected")
+        try:
+            await self._websocket.send_message_immediate(message)
+            self._connection_stats["messages_sent"] += 1
+            logger.debug(f"Sent critical message: {message[:100]}...")
+        except Exception as e:
+            logger.error(f"Failed to send critical message: {e}")
+            self.is_connected = False
+            await error_monitor.record_error(
+                error_type="send_message_failed",
+                severity=ErrorSeverity.HIGH,
+                category=ErrorCategory.CONNECTION,
+                message=f"Failed to send critical message: {str(e)}",
+                context={"message": message[:100]},
+            )
+            raise ConnectionError(f"Failed to send critical message: {e}") from e
 
     async def on_message(self, message: Union[str, bytes]):
         """

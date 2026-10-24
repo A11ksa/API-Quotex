@@ -9,7 +9,9 @@ import cloudscraper
 from loguru import logger
 from pathlib import Path
 from typing import Dict, Tuple, Any, Optional
+from urllib.parse import urlsplit
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv, set_key
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -24,7 +26,9 @@ logger.add(log_filename, level="INFO", encoding="utf-8", backtrace=True, diagnos
 SESSION_DIR = Path("sessions")
 SESSION_FILE = SESSION_DIR / "session.json"
 CREDENTIALS_FILE = SESSION_DIR / "config.json"
-QX_BASE = "https://qxbroker.com"
+QX_BASE = "https://quotex.com"
+ENV_FILE = Path.cwd() / ".env"
+load_dotenv(ENV_FILE, override=False)
 
 # Persistence helpers (via Config singleton)
 def load_config() -> Dict[str, Any]:
@@ -42,12 +46,36 @@ def load_session() -> Dict[str, Any]:
 def save_session(session_data: Dict[str, Any]) -> None:
     cfg = Config()
     cfg.save_session(session_data)
+    ssid = session_data.get("ssid")
+    if ssid:
+        updated = set_key(str(ENV_FILE), "QUOTEX_SSID", ssid, quote_mode="always")
+        if not updated[0]:
+            raise OSError(f"Failed to save QUOTEX_SSID to {ENV_FILE}")
+        ENV_FILE.chmod(0o600)
+        os.environ["QUOTEX_SSID"] = ssid
 
 # URL helpers
 def _login_urls(lang: str, is_demo: bool) -> Tuple[str, str]:
     login_url = f"{QX_BASE}/{lang}/sign-in/"
     target_url = f"{QX_BASE}/{lang}/demo-trade" if is_demo else f"{QX_BASE}/{lang}/trade"
     return login_url, target_url
+
+def _infer_is_demo_from_url(url: str) -> Optional[bool]:
+    parsed = urlsplit(url)
+    hostname = (parsed.hostname or "").lower()
+    if not (
+        hostname == "quotex.com"
+        or hostname.endswith(".quotex.com")
+        or hostname == "qxbroker.com"
+        or hostname.endswith(".qxbroker.com")
+    ):
+        return None
+    path_parts = {part.lower() for part in parsed.path.split("/") if part}
+    if "demo-trade" in path_parts:
+        return True
+    if "trade" in path_parts:
+        return False
+    return None
 
 # SSID utils
 def _cookies_string_to_dict(cookie_header: Optional[str]) -> Dict[str, str]:
@@ -102,7 +130,7 @@ async def validate_ssid(ssid: str) -> bool:
         else:
             urls = [url for name, url in all_regions.items() if "DEMO" not in name.upper()] or list(all_regions.values())
     except Exception:
-        urls = ["wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket"]
+        urls = ["wss://ws2.quotex.com/socket.io/?EIO=3&transport=websocket"]
     client = AsyncWebSocketClient()
     for url in urls:
         try:
@@ -170,6 +198,14 @@ async def _playwright_login_and_capture(email: str, password: str, lang: str, is
                 except PlaywrightTimeoutError:
                     pass
             await page.goto(target_url, wait_until="domcontentloaded", timeout=45_000)
+            actual_is_demo = _infer_is_demo_from_url(page.url)
+            if actual_is_demo is None:
+                raise RuntimeError(f"Could not determine account mode from final URL: {page.url}")
+            if actual_is_demo != is_demo:
+                raise RuntimeError(
+                    f"Requested {'demo' if is_demo else 'live'} session but Quotex opened "
+                    f"{'demo' if actual_is_demo else 'live'} trade URL: {page.url}"
+                )
             await page.wait_for_load_state("networkidle", timeout=20_000)
             try:
                 token = await page.evaluate("() => window?.settings?.token ?? null")
@@ -290,8 +326,20 @@ async def get_ssid(email: str = None, password: str = None, email_pass: str = No
             if source:
                 ssid_candidate = f'42["authorization",{{"session":"{source}","isDemo":{1 if is_demo else 0},"tournamentId":0}}]'
                 session_data["ssid"] = ssid_candidate
-        if ssid_candidate and await validate_ssid(ssid_candidate):
+        session_is_demo = _infer_is_demo_from_ssid(
+            ssid_candidate,
+            default_demo=bool(session_data.get("is_demo", is_demo)),
+        ) if ssid_candidate else None
+        if ssid_candidate and session_is_demo != is_demo:
+            logger.info(
+                "Saved session is for %s mode; requested %s mode. Not reusing it.",
+                "demo" if session_is_demo else "live",
+                "demo" if is_demo else "live",
+            )
+        elif ssid_candidate and await validate_ssid(ssid_candidate):
             logger.info("Existing session is valid.")
+            session_data["ssid"] = ssid_candidate
+            save_session(session_data)
             return True, session_data
         else:
             logger.warning("Existing session is invalid or expired; removing session.json")
@@ -301,6 +349,15 @@ async def get_ssid(email: str = None, password: str = None, email_pass: str = No
             except Exception as e:
                 logger.error(f"Failed to remove session.json: {str(e)}")
             session_data = {}
+
+    env_ssid = os.getenv("QUOTEX_SSID")
+    if env_ssid and _infer_is_demo_from_ssid(env_ssid, default_demo=is_demo) == is_demo:
+        if await validate_ssid(env_ssid):
+            session_data = {"ssid": env_ssid, "is_demo": is_demo}
+            save_session(session_data)
+            logger.info("Using validated SSID from .env")
+            return True, session_data
+        logger.warning("SSID from .env is invalid or expired; continuing with login")
 
     # Step 2: Load credentials
     creds = load_config()

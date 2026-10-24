@@ -24,7 +24,7 @@ class ConnectionConfig:
 class TradingConfig:
     min_order_amount: float = 1.0
     max_order_amount: float = 50000.0
-    min_duration: int = 30
+    min_duration: int = 60
     max_duration: int = 14400
     max_concurrent_orders: int = 10
     default_timeout: float = 30.0

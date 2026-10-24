@@ -15,10 +15,15 @@ classifiers = [
 ]
 dependencies = [
     "playwright>=1.40.0",
+    "python-dotenv>=1.0.0",
     "websockets>=12.0",
     "asyncio-mqtt>=0.12.0",
     "pydantic>=2.0.0",
     "requests>=2.31.0",
+    "pandas>=2.0.0",
+    "loguru>=0.7.0",
+    "cloudscraper>=1.2.71",
+    "beautifulsoup4>=4.12.0",
 ]
 
 [project.optional-dependencies]
@@ -32,3 +37,10 @@ dev = [
 Homepage = "https://github.com/A11ksa/API-Quotex"
 Repository = "https://github.com/A11ksa/API-Quotex"
 Documentation = "https://github.com/A11ksa/API-Quotex/blob/main/README.md"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["api_quotex*"]
+exclude = ["sessions*"]

@@ -1,25 +1,34 @@
 import asyncio
+import argparse
 import json
 import os
 import re
 import time
 import base64
-import getpass
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
+from urllib.parse import urlsplit
 
+from dotenv import load_dotenv, set_key
 from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError, Frame
 
-CONFIG_PATH = Path("config.json")
-SESSION_PATH = Path("session.json")
+ENV_PATH = Path(".env")
+load_dotenv(ENV_PATH)
+SESSION_PATH = Path("sessions/session.json")
 
 def _print(msg: str) -> None:
     ts = time.strftime("%H:%M:%S")
     print(f"[{ts}] {msg}")
 
 def _safe_json_dump(path: Path, data: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=4, ensure_ascii=False), encoding="utf-8")
+    path.chmod(0o600)
+
+def _payload_text(payload: Union[str, bytes]) -> str:
+    if isinstance(payload, bytes):
+        return payload.decode("utf-8", errors="replace")
+    return payload
 
 def _extract_ssid_from_socketio(payload: str) -> Optional[str]:
     """Extract SSID from Socket.IO frames like:
@@ -47,7 +56,9 @@ def _extract_ssid_from_socketio(payload: str) -> Optional[str]:
         pass
     return None
 
-def _extract_ssid_from_payload(payload: str) -> Optional[str]:
+def _extract_ssid_from_payload(payload: Union[str, bytes]) -> Optional[str]:
+    payload = _payload_text(payload)
+
     # 0) Socket.IO
     ssid = _extract_ssid_from_socketio(payload)
     if ssid:
@@ -101,27 +112,66 @@ def _extract_ssid_from_payload(payload: str) -> Optional[str]:
         return m.group(1)
     return None
 
-@dataclass
-class Credentials:
-    email: str
-    password: str
+def _extract_is_demo_from_payload(payload: Union[str, bytes]) -> Optional[bool]:
+    payload = _payload_text(payload)
+
+    try:
+        start = payload.find("[")
+        message = json.loads(payload[start:]) if start >= 0 else json.loads(payload)
+        if isinstance(message, list) and len(message) >= 2 and isinstance(message[1], dict):
+            value = message[1].get("isDemo")
+        elif isinstance(message, dict):
+            value = message.get("isDemo", message.get("is_demo"))
+        else:
+            return None
+        return bool(int(value)) if value is not None else None
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+def _infer_is_demo_from_url(url: str) -> Optional[bool]:
+    parsed = urlsplit(url)
+    hostname = (parsed.hostname or "").lower()
+    if not (
+        hostname == "quotex.com"
+        or hostname.endswith(".quotex.com")
+        or hostname == "qxbroker.com"
+        or hostname.endswith(".qxbroker.com")
+    ):
+        return None
+    path_parts = {part.lower() for part in parsed.path.split("/") if part}
+    if "demo-trade" in path_parts:
+        return True
+    if "trade" in path_parts:
+        return False
+    return None
+
+def _trade_url(is_demo: bool, lang: str = "en") -> str:
+    route = "demo-trade" if is_demo else "trade"
+    return f"https://quotex.com/{lang}/{route}"
 
 class QuotexBot:
-    def __init__(self, creds: Credentials, headless: bool = False):
-        self.email = creds.email
-        self.password = creds.password
+    def __init__(self, headless: bool = False, is_demo: bool = True):
+        self.email = os.getenv("QUOTEX_EMAIL", "")
+        self.password = os.getenv("QUOTEX_PASSWORD", "")
         self.headless = headless
+        self.is_demo = is_demo
         self.ws_urls: List[str] = []
         self.ssid: Optional[str] = None
+        self.captured_is_demo: Optional[bool] = None
 
     # persistence
-    def save_config(self) -> None:
-        _safe_json_dump(CONFIG_PATH, {"email": self.email, "password": self.password})
-        _print("Login credentials saved to config.json")
-
     def save_session(self) -> None:
-        _safe_json_dump(SESSION_PATH, {"ssid": self.ssid})
-        _print("Session data saved to session.json (ssid only)")
+        if self.captured_is_demo is None:
+            raise RuntimeError("Refusing to save a session without a confirmed account mode")
+        if self.ssid and not self.ssid.startswith('42["authorization",'):
+            auth_data = {"session": self.ssid, "isDemo": int(self.captured_is_demo), "tournamentId": 0}
+            self.ssid = '42["authorization",' + json.dumps(auth_data, separators=(",", ":")) + "]"
+        _safe_json_dump(SESSION_PATH, {"ssid": self.ssid, "is_demo": self.captured_is_demo})
+        set_key(str(ENV_PATH), "QUOTEX_SSID", self.ssid, quote_mode="always")
+        ENV_PATH.chmod(0o600)
+        os.environ["QUOTEX_SSID"] = self.ssid
+        _print(f"{'Demo' if self.captured_is_demo else 'Live'} session saved to sessions/session.json")
+        _print("SSID saved to .env")
 
     # helpers
     async def _dismiss_banners(self, page) -> None:
@@ -373,7 +423,7 @@ class QuotexBot:
 
         if not clicked_submit:
             try:
-                await form_scope.press('input[name="password"]', 'Enter')
+                await page.locator('#tab-1 input[name="password"]').press('Enter')
                 _print("Submitted login form via Enter key.")
                 clicked_submit = True
             except Exception:
@@ -440,9 +490,6 @@ class QuotexBot:
 
     # main
     async def run(self) -> None:
-        _safe_json_dump(CONFIG_PATH, {"email": self.email, "password": self.password})
-        _print("Login credentials saved to config.json")
-
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(
                 headless=self.headless,
@@ -469,7 +516,7 @@ class QuotexBot:
             )
             await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
 
-            await self._grant_notifications(context, "https://qxbroker.com")
+            await self._grant_notifications(context, "https://quotex.com")
 
             page = await context.new_page()
 
@@ -483,9 +530,19 @@ class QuotexBot:
                     if "application/json" in ct:
                         text = await response.text()
                         m = re.search(r'"session"\\s*:\\s*"([^"]{8,})"', text)
-                        if m and not self.ssid:
+                        payload_mode = _extract_is_demo_from_payload(text)
+                        url_mode = _infer_is_demo_from_url(page.url)
+                        if payload_mode is not None and url_mode is not None and payload_mode != url_mode:
+                            _print("Session response mode conflicts with the current trade URL; ignoring it.")
+                            return
+                        is_demo = payload_mode if payload_mode is not None else url_mode
+                        if m and not self.ssid and is_demo is not None:
+                            if is_demo != self.is_demo:
+                                _print("Session response does not match the selected account mode; ignoring it.")
+                                return
                             self.ssid = m.group(1)
-                            _print(f"SSID captured (HTTP): {self.ssid}")
+                            self.captured_is_demo = is_demo
+                            _print("Session captured from HTTP response.")
                             self.save_session()
                             ssid_event.set()
                 except Exception:
@@ -503,8 +560,21 @@ class QuotexBot:
                         return
                     ssid = _extract_ssid_from_payload(payload)
                     if ssid:
+                        payload_mode = _extract_is_demo_from_payload(payload)
+                        url_mode = _infer_is_demo_from_url(page.url)
+                        if payload_mode is not None and url_mode is not None and payload_mode != url_mode:
+                            _print("Session frame mode conflicts with the current trade URL; ignoring it.")
+                            return
+                        is_demo = payload_mode if payload_mode is not None else url_mode
+                        if is_demo is None:
+                            _print("Session frame has no mode and the current URL is not a demo/live trade URL; ignoring it.")
+                            return
+                        if is_demo != self.is_demo:
+                            _print("Session frame does not match the selected account mode; ignoring it.")
+                            return
                         self.ssid = ssid
-                        _print(f"SSID captured (WS): {self.ssid}")
+                        self.captured_is_demo = is_demo
+                        _print(f"{'Demo' if is_demo else 'Live'} session captured from WebSocket.")
                         self.save_session()
                         ssid_event.set()
 
@@ -516,66 +586,68 @@ class QuotexBot:
 
             page.on("websocket", on_websocket)
 
-            url = "https://qxbroker.com/en/sign-in/"
+            url = "https://quotex.com/en/sign-in/"
             _print(f"Navigating to {url} ...")
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
             await self._dismiss_banners(page)
             await self._try_click_allow_ui(page)
-            await self._fill_login(page)
+            if self.email and self.password:
+                await self._fill_login(page)
+                target_url = _trade_url(self.is_demo)
+                _print(f"Opening selected {'demo' if self.is_demo else 'live'} account: {target_url}")
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+                actual_mode = _infer_is_demo_from_url(page.url)
+                if actual_mode != self.is_demo:
+                    raise RuntimeError(
+                        f"Quotex did not open the selected {'demo' if self.is_demo else 'live'} route; "
+                        f"current URL is {page.url}"
+                    )
+            else:
+                _print(
+                    "Complete sign-in manually in the browser; credentials will not be saved. "
+                    f"After sign-in, the helper will open {_trade_url(self.is_demo)}."
+                )
+                await page.wait_for_url(re.compile(r"/(?:demo-)?trade(?:/|$)"), timeout=300000)
+                await page.goto(_trade_url(self.is_demo), wait_until="domcontentloaded", timeout=60000)
+                actual_mode = _infer_is_demo_from_url(page.url)
+                if actual_mode != self.is_demo:
+                    raise RuntimeError(
+                        f"Quotex did not open the selected {'demo' if self.is_demo else 'live'} route; "
+                        f"current URL is {page.url}"
+                    )
 
-            # Wait up to 30s for SSID; fallback to client storage
+            timeout = 30 if self.email and self.password else 300
             try:
-                await asyncio.wait_for(ssid_event.wait(), timeout=30)
+                await asyncio.wait_for(ssid_event.wait(), timeout=timeout)
                 _print("SSID saved. Closing browser now...")
             except asyncio.TimeoutError:
-                _print("SSID was not captured from network within 30s; scanning client storage...")
+                _print("SSID was not captured from network; scanning client storage...")
                 ssid = await self._scan_client_storage_for_ssid(page)
                 if ssid:
-                    self.ssid = ssid
-                    self.save_session()
-                    _print("SSID saved from client storage. Closing browser now...")
+                    is_demo = _infer_is_demo_from_url(page.url)
+                    if is_demo is None or is_demo != self.is_demo:
+                        _print(f"Could not determine account mode from URL {page.url}; refusing to save the SSID.")
+                    else:
+                        self.ssid = ssid
+                        self.captured_is_demo = is_demo
+                        self.save_session()
+                        _print("SSID saved from client storage. Closing browser now...")
                 else:
                     _print("SSID not found. Closing browser.")
 
             await browser.close()
 
-def prompt_for_credentials(existing_email: str = "", existing_password: str = "") -> Credentials:
-    print("\\n=== Enter Quotex login credentials (will be saved to config.json) ===")
-    while True:
-        prompt = f"Email [{existing_email}]: " if existing_email else "Email: "
-        entered = input(prompt).strip()
-        email = entered or existing_email
-        if email:
-            break
-        print("Email cannot be empty. Please try again.")
-    while True:
-        pw_prompt = "(input hidden) Password"
-        if existing_password:
-            pw_prompt += " [press Enter to keep existing]"
-        pw_prompt += ": "
-        entered_pw = getpass.getpass(pw_prompt)
-        password = entered_pw if entered_pw else existing_password
-        if password:
-            break
-        print("Password cannot be empty. Please try again.")
-    return Credentials(email=email, password=password)
-
 async def main():
-    # Preload (to show defaults), then ALWAYS prompt
-    if CONFIG_PATH.exists():
-        try:
-            cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            cfg = {}
-        existing_email = cfg.get("email", "")
-        existing_password = cfg.get("password", "")
-    else:
-        existing_email = os.environ.get("QX_EMAIL", "")
-        existing_password = os.environ.get("QX_PASSWORD", "")
-
-    creds = prompt_for_credentials(existing_email, existing_password)
-    bot = QuotexBot(creds, headless=False)
+    parser = argparse.ArgumentParser(description="Sign in to Quotex and save a reusable session.")
+    parser.add_argument(
+        "--mode",
+        choices=("demo", "live"),
+        default="demo",
+        help="Account to open and capture (default: demo).",
+    )
+    args = parser.parse_args()
+    bot = QuotexBot(headless=False, is_demo=args.mode == "demo")
     await bot.run()
 
 if __name__ == "__main__":

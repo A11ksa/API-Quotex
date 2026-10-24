@@ -118,8 +118,8 @@ def update_assets_from_api(api_assets: List[Dict[str, Any]]) -> None:
 
 class Regions:
     _REGIONS: Dict[str, str] = {
-        "DEMO": "wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket",
-        "LIVE": "wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket",
+        "DEMO": "wss://ws2.quotex.com/socket.io/?EIO=3&transport=websocket",
+        "LIVE": "wss://ws2.quotex.com/socket.io/?EIO=3&transport=websocket",
     }
 
     @classmethod
@@ -176,7 +176,7 @@ CONNECTION_SETTINGS: Dict[str, float] = {
 API_LIMITS: Dict[str, float] = {
     "min_order_amount": 1.0,
     "max_order_amount": 50000.0,
-    "min_duration": 30,
+    "min_duration": 60,
     "max_duration": 14400,
     "max_concurrent_orders": 10,
     "rate_limit": 100,
@@ -188,7 +188,7 @@ DEFAULT_HEADERS: Dict[str, str] = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/125.0.0.0 Safari/537.36"
     ),
-    "Origin": "https://qxbroker.com",
-    "Referer": "https://qxbroker.com/",
+    "Origin": "https://quotex.com",
+    "Referer": "https://quotex.com/",
     "Accept-Language": "en-US,en;q=0.9",
 }

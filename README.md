@@ -109,7 +109,7 @@ if __name__ == "__main__":
 ```
 +---------------------+
 |  Playwright Helper  |  (Login UI)
-|  - opens browser    |--> SSID saved to sessions/session.json
+|  - opens browser    |--> SSID saved to sessions/session.json and .env
 +----------+----------+
            |
            v
@@ -148,17 +148,9 @@ print(status, profit)
 ---
 
 ## Sessions & SSID
-- First run opens Chromium and stores **SSID** in `sessions/session.json`
-- Subsequent runs reuse it until expiry (then it auto-refreshes via login)
-
-**Manual override**
-
-```json
-{
-  "live": "A8i6rBIfrfrfUYD9BkfGKv00000akJkSeouX73q",
-  "demo": "A8i6rBIfrfrfUYD9BkfGKv00000akJkSeouX73q"
-}
-```
+- First login stores the **SSID** in `sessions/session.json` and as `QUOTEX_SSID` in `.env`.
+- Subsequent runs validate and reuse the saved session; expired sessions are refreshed through login.
+- `.env` is ignored by Git and restricted to owner-only permissions when the SSID is written. Treat it as a secret.
 
 ---
 

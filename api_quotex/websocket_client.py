@@ -1,11 +1,12 @@
 """Async WebSocket client for Quotex API."""
 import asyncio
+import inspect
 import json
 import ssl
 import time
 import base64
 from datetime import datetime
-import pkg_resources
+from importlib.metadata import version as package_version
 from collections import deque
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -26,6 +27,12 @@ logger.add(log_filename, level="INFO", encoding="utf-8", backtrace=True, diagnos
 def _now_ms() -> int:
     """Return current time in milliseconds."""
     return int(time.time() * 1000)
+
+def _websocket_is_closed(websocket: Any) -> bool:
+    closed = getattr(websocket, "closed", None)
+    if closed is not None:
+        return closed
+    return getattr(getattr(websocket, "state", None), "name", None) == "CLOSED"
 
 class MessageBatcher:
     """Batch outgoing messages to reduce WebSocket send calls under high load."""
@@ -114,6 +121,7 @@ class AsyncWebSocketClient:
         self._max_reconnect_attempts: int = CONNECTION_SETTINGS["max_reconnect_attempts"]
         self._message_batcher = MessageBatcher()
         self._flush_task: Optional[asyncio.Task] = None  # delayed flush for small bursts
+        self._send_lock = asyncio.Lock()
         self._connection_pool = ConnectionPool()
         self._rate_limiter = asyncio.Semaphore(10)
         self._message_cache: Dict[int, Any] = {}
@@ -142,7 +150,7 @@ class AsyncWebSocketClient:
     def is_connected(self) -> bool:
         return (
             self.websocket is not None
-            and not self.websocket.closed
+            and not _websocket_is_closed(self.websocket)
             and self.connection_info is not None
             and self.connection_info.status == ConnectionStatus.CONNECTED
             and self.websocket_is_connected
@@ -157,7 +165,7 @@ class AsyncWebSocketClient:
                 ssl_context.verify_mode = ssl.CERT_NONE
                 ssl_context.minimum_version = ssl.TLSVersion.TLSv1_3
                 ssl_context.options = (ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1) | ssl.OP_NO_TLSv1_2
-                ws_version = pkg_resources.get_distribution("websockets").version
+                ws_version = package_version("websockets")
                 connect_kwargs = {
                     "uri": url,
                     "ssl": ssl_context,
@@ -165,7 +173,9 @@ class AsyncWebSocketClient:
                     "ping_timeout": 5,
                     "close_timeout": CONNECTION_SETTINGS["close_timeout"],
                 }
-                if float(ws_version.split('.')[0]) >= 8:
+                if float(ws_version.split('.')[0]) >= 14:
+                    connect_kwargs["additional_headers"] = DEFAULT_HEADERS
+                elif float(ws_version.split('.')[0]) >= 8:
                     connect_kwargs["extra_headers"] = DEFAULT_HEADERS
                 else:
                     connect_kwargs["headers"] = DEFAULT_HEADERS
@@ -255,7 +265,7 @@ class AsyncWebSocketClient:
         Uses a short delayed flush to coalesce bursts; messages are sent as separate frames
         to preserve Socket.IO framing (no concatenation).
         """
-        if not self.websocket or self.websocket.closed:
+        if not self.websocket or _websocket_is_closed(self.websocket):
             self.websocket_is_connected = False
             raise WebSocketError("WebSocket is not connected")
 
@@ -268,9 +278,10 @@ class AsyncWebSocketClient:
             # Add to batch; if threshold reached, send immediately (each as its own frame)
             batch = await self._message_batcher.add_message(message)
             if batch:
-                for msg in batch:
-                    await self.websocket.send(msg)
-                    logger.debug(f"Sent batched message: {msg}")
+                async with self._send_lock:
+                    for msg in batch:
+                        await self.websocket.send(msg)
+                        logger.debug(f"Sent batched message: {msg}")
 
             # Ensure a short delayed flush for small bursts
             if not self._flush_task or self._flush_task.done():
@@ -291,16 +302,49 @@ class AsyncWebSocketClient:
             )
             raise WebSocketError(f"Failed to send message: {str(e)}")
 
+    async def send_message_immediate(self, message: str) -> None:
+        """Flush queued frames and send a critical frame before returning."""
+        if not self.websocket or _websocket_is_closed(self.websocket):
+            self.websocket_is_connected = False
+            raise WebSocketError("WebSocket is not connected")
+
+        while self.ssl_mutual_exclusion or self.ssl_mutual_exclusion_write:
+            await asyncio.sleep(0.1)
+
+        self.ssl_mutual_exclusion_write = True
+        try:
+            async with self._send_lock:
+                queued_messages = await self._message_batcher.flush_batch()
+                for queued in queued_messages:
+                    await self.websocket.send(queued)
+                    logger.debug(f"Sent queued message before critical frame: {queued}")
+                await self.websocket.send(message)
+                logger.debug(f"Sent critical WebSocket frame: {message}")
+        except Exception as e:
+            logger.error(f"Failed to send critical WebSocket frame: {str(e)}")
+            self.websocket_is_connected = False
+            await error_monitor.record_error(
+                error_type="websocket_send_failed",
+                severity=ErrorSeverity.HIGH,
+                category=ErrorCategory.CONNECTION,
+                message=f"Failed to send critical WebSocket frame: {str(e)}",
+                context={"message": message[:100]},
+            )
+            raise WebSocketError(f"Failed to send critical WebSocket frame: {str(e)}") from e
+        finally:
+            self.ssl_mutual_exclusion_write = False
+
     async def _delayed_flush(self) -> None:
         """Flush pending messages after a short delay to coalesce bursts."""
         await asyncio.sleep(0.04)
-        leftover = await self._message_batcher.flush_batch()
-        if not leftover:
-            return
         try:
-            for msg in leftover:
-                await self.websocket.send(msg)
-                logger.debug(f"Sent delayed-flush message: {msg}")
+            async with self._send_lock:
+                leftover = await self._message_batcher.flush_batch()
+                if not leftover:
+                    return
+                for msg in leftover:
+                    await self.websocket.send(msg)
+                    logger.debug(f"Sent delayed-flush message: {msg}")
         except Exception as e:
             logger.error(f"Failed to flush batched messages: {str(e)}")
             await error_monitor.record_error(
@@ -521,7 +565,7 @@ class AsyncWebSocketClient:
         while self._running and self.websocket:
             try:
                 await asyncio.sleep(25)
-                if self.websocket and not self.websocket.closed:
+                if self.websocket and not _websocket_is_closed(self.websocket):
                     await self.send_message("2")
                     if self.connection_info:
                         self.connection_info = ConnectionInfo(
@@ -712,6 +756,22 @@ class AsyncWebSocketClient:
             event = data[0]
             body = data[1] if len(data) > 1 else {}
 
+            if event in (
+                "orders/open",
+                "s_orders/open",
+                "successopenOrder",
+                "orders/opened/list",
+                "s_orders/close",
+                "successcloseOrder",
+                "orders/closed/list",
+                "error",
+            ):
+                logger.info(
+                    "Order protocol response: event={} body={}",
+                    event,
+                    json.dumps(body, separators=(",", ":"), default=str),
+                )
+
             # ---- Routing (unified) ----
             if event == "s_authorization":
                 await self._emit_event("authenticated", body)
@@ -733,6 +793,10 @@ class AsyncWebSocketClient:
 
             if event in ("successupdateBalance",):
                 await self._emit_event("balance_updated", body)
+                return
+
+            if event in ("orders/opened/list",):
+                await self._emit_event("orders_opened_list", body)
                 return
 
             if event in ("s_orders/open", "successopenOrder"):
@@ -797,11 +861,15 @@ class AsyncWebSocketClient:
                     return "assets_list"
                 if isinstance(first, list) and len(first) >= 3 and isinstance(first[0], str) and isinstance(first[1], (int, float)):
                     return "quote_stream"
+                if all(isinstance(item, dict) for item in payload if isinstance(item, dict)):
+                    return "orders_opened_list"
             if isinstance(payload, dict):
                 if all(k in payload for k in ("asset", "period", "history")):
                     return "candles_received"
                 if "uid" in payload and "balance" in payload:
                     return "balance_data"
+                if "deals" in payload or "ticket" in payload or "profit" in payload:
+                    return "order_closed"
         except Exception:
             pass
         return "json_data"
@@ -896,31 +964,68 @@ class AsyncWebSocketClient:
         try:
             if not message.startswith("\x04"):
                 return
-            payload = json.loads(message[1:])  # strip ETX
-            # If no pending header, infer and dispatch quickly (Pocket Option-like)
+            payload = json.loads(message[1:])
             if not self._pending_binary_event:
                 inferred = self._event_headerless_payload(payload)
-                # Direct emit with no extra allocations/log noise
                 await self._emit_event(inferred, payload)
                 return
-            # We have a pending 451 header → route deterministically
+
             event_name = self._pending_binary_event
             self._pending_binary_event = None
+
+            if event_name in (
+                "s_orders/open",
+                "s_orders/close",
+                "orders/opened/list",
+                "orders/closed/list",
+                "successopenOrder",
+                "successcloseOrder",
+                "error",
+            ):
+                logger.info(
+                    "Order protocol response: event={} body={}",
+                    event_name,
+                    json.dumps(payload, separators=(",", ":"), default=str),
+                )
+
             if event_name == "s_balance":
                 await self._emit_event("balance_data", payload)
-            elif event_name == "s_orders/open":
-                await self._emit_event("order_opened", payload)
-            elif event_name == "s_orders/close":
-                deals = (payload or {}).get("deals") or []
-                if isinstance(deals, list):
-                    for d in deals:
-                        await self._emit_event("order_closed", d)
-                else:
-                    ticket = (payload or {}).get("ticket")
-                    if isinstance(ticket, dict):
-                        await self._emit_event("order_closed", ticket)
+            elif event_name in ("s_orders/open", "successopenOrder"):
+                if isinstance(payload, dict):
+                    await self._emit_event("order_opened", payload)
+                elif isinstance(payload, str) and payload.strip().upper() == "OPEN":
+                    return
+            elif event_name in ("s_orders/close", "successcloseOrder"):
+                if isinstance(payload, list):
+                    for d in payload:
+                        if isinstance(d, dict):
+                            await self._emit_event("order_closed", d)
+                elif isinstance(payload, dict):
+                    deals = payload.get("deals") or []
+                    if isinstance(deals, list):
+                        for d in deals:
+                            if isinstance(d, dict):
+                                await self._emit_event("order_closed", d)
+                    else:
+                        ticket = payload.get("ticket")
+                        if isinstance(ticket, dict):
+                            await self._emit_event("order_closed", ticket)
+                        elif payload:
+                            await self._emit_event("order_closed", payload)
+            elif event_name == "orders/opened/list":
+                if isinstance(payload, list):
+                    await self._emit_event("orders_opened_list", payload)
+                elif isinstance(payload, dict):
+                    await self._emit_event("order_opened", payload)
             elif event_name == "orders/closed/list":
-                await self._emit_event("orders_closed_list", payload if isinstance(payload, list) else [])
+                if isinstance(payload, list):
+                    await self._emit_event("orders_closed_list", payload)
+                elif isinstance(payload, dict):
+                    deals = payload.get("deals") or []
+                    if isinstance(deals, list):
+                        for d in deals:
+                            if isinstance(d, dict):
+                                await self._emit_event("order_closed", d)
             elif event_name == "instruments/list":
                 await self._emit_event("assets_list", payload)
             elif event_name == "quotes/stream":
@@ -929,6 +1034,8 @@ class AsyncWebSocketClient:
                 await self._emit_event("candles_received", payload)
             elif event_name == "chart_notification/get":
                 await self._emit_event("candles_received", payload)
+            elif event_name == "error":
+                await self._emit_event("error", payload)
             else:
                 await self._emit_event("json_data", {"event": event_name, "data": payload})
         except json.JSONDecodeError as e:
@@ -954,7 +1061,7 @@ class AsyncWebSocketClient:
         handlers = self._event_handlers.get(event, [])
         for cb in handlers:
             try:
-                if asyncio.iscoroutinefunction(cb):
+                if inspect.iscoroutinefunction(cb):
                     await cb(data)
                 else:
                     cb(data)

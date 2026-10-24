@@ -1,5 +1,6 @@
 """Professional Async Quotex API Client – Unified & Cleaned."""
 import asyncio
+import inspect
 import os
 import json
 import time
@@ -15,7 +16,7 @@ from loguru import logger
 from .monitoring import error_monitor, health_checker, ErrorCategory, ErrorSeverity
 from .websocket_client import AsyncWebSocketClient
 from .models import Balance, Candle, Order, OrderResult, OrderStatus, OrderDirection, ConnectionStatus, ServerTime
-from .constants import ASSETS, REGIONS, TIMEFRAMES, API_LIMITS, CONNECTION_SETTINGS
+from .constants import ASSETS, REGIONS, TIMEFRAMES, API_LIMITS, CONNECTION_SETTINGS, update_assets_from_api
 from .exceptions import QuotexError, ConnectionError, AuthenticationError, OrderError, InvalidParameterError, WebSocketError, Base64DecodeError
 from .utils import sanitize_symbol, format_session_id, retry_async, candles_to_dataframe
 from .login import get_ssid
@@ -114,12 +115,14 @@ class AsyncQuotexClient:
         self._active_orders: Dict[str, OrderResult] = {}          # key = requestId
         self._order_results: Dict[str, OrderResult] = {}          # key = requestId
         self._pending_order_requests: Dict[str, Order] = {}       # key = requestId
+        self._order_errors: Dict[str, str] = {}
         self._candles_cache: Dict[str, List[Candle]] = {}
         self._assets_data: Dict[str, Dict[str, Any]] = {}
         self._assets_requests: Dict[str, asyncio.Future] = {}
         self._candle_requests: Dict[str, asyncio.Future] = {}
         self._balance_requests: Dict[str, asyncio.Future] = {}
         self._payout_data: Dict[str, float] = {}
+        self._quote_update_events: Dict[str, asyncio.Event] = {}
         self._server_time: Optional[ServerTime] = None
         self._event_callbacks: Dict[str, List[Callable]] = defaultdict(list)
         # Mapping between requestId and server order id; plus reverse index
@@ -443,6 +446,34 @@ class AsyncQuotexClient:
             )
             return False
 
+    async def send_message_immediate(self, message: str) -> None:
+        if not self.is_connected:
+            raise ConnectionError("Not connected to Quotex")
+
+        try:
+            while self.ssl_mutual_exclusion or self.ssl_mutual_exclusion_write:
+                await asyncio.sleep(0.1)
+            self.ssl_mutual_exclusion_write = True
+
+            if self._is_persistent and self._keep_alive_manager:
+                await self._keep_alive_manager.send_message_immediate(message)
+            else:
+                await self._websocket.send_message_immediate(message)
+
+            self._connection_stats["messages_sent"] += 1
+        except Exception as e:
+            logger.error(f"Failed to send critical message: {str(e)}")
+            await self._error_monitor.record_error(
+                error_type="send_message_failed",
+                severity=ErrorSeverity.HIGH,
+                category=ErrorCategory.CONNECTION,
+                message=f"Failed to send critical message: {str(e)}",
+                context={"message": message[:100]},
+            )
+            raise ConnectionError(f"Failed to send critical message: {e}") from e
+        finally:
+            self.ssl_mutual_exclusion_write = False
+
     def get_connection_stats(self) -> Dict[str, Any]:
         stats = self._connection_stats.copy()
         if self._is_persistent and self._keep_alive_manager:
@@ -501,19 +532,22 @@ class AsyncQuotexClient:
         parsed_secs = self._parse_seconds(duration)
         self._validate_order_parameters(asset, amount, direction, int(parsed_secs))
 
-        req_id = str(int(time.time() * 1000))
+        req_id = str(int(time.time()))
         order = Order(asset=asset, amount=amount, direction=direction, duration=int(parsed_secs), request_id=req_id)
         self._pending_order_requests[req_id] = order
+        self._order_errors.pop(req_id, None)
 
         try:
             await self._send_order(order)
             result = await self._wait_for_order_result(req_id, order, timeout=180.0)  # Increased timeout
+            self._order_errors.pop(req_id, None)
             logger.info(f"Order placed: {result.order_id} - {result.status}")
             return result
 
         except Exception as e:
             logger.error(f"Order placement failed: {str(e)}")
             self._pending_order_requests.pop(req_id, None)
+            self._order_errors.pop(req_id, None)
             await self._error_monitor.record_error(
                 error_type="order_placement_failed",
                 severity=ErrorSeverity.HIGH,
@@ -569,21 +603,44 @@ class AsyncQuotexClient:
             "optionType": int(option_type)
         }
 
-        try:
-            await self.send_message('42["tick"]')
-            await self.send_message(f'42["instruments/follow","{order.asset}"]')
-        except Exception:
-            pass
+        await self._prepare_asset_for_order(order.asset)
 
         message = f'42["orders/open",{json.dumps(payload, separators=(",",":"))}]'
-        await self.send_message(message)
+        await self.send_message_immediate(message)
         if self.enable_logging:
-            logger.debug(f"Sent order: {message}")
+            logger.info(
+                "Order request sent to WebSocket: {}",
+                json.dumps(payload, separators=(",", ":")),
+            )
+
+    async def _prepare_asset_for_order(self, asset: str) -> None:
+        quote_event = asyncio.Event()
+        self._quote_update_events[asset] = quote_event
+        setup_frames = (
+            f'42["instruments/update",{{"asset":"{asset}","period":60}}]',
+            f'42["chart_notification/get",{{"asset":"{asset}","version":"1.0.0"}}]',
+            f'42["depth/follow","{asset}"]',
+            '42["tick"]',
+        )
+        try:
+            for frame in setup_frames:
+                if not await self.send_message(frame):
+                    raise ConnectionError(f"Could not send required order setup frame: {frame}")
+            await asyncio.wait_for(quote_event.wait(), timeout=10.0)
+        except asyncio.TimeoutError as e:
+            raise TimeoutError(f"No fresh quote received for {asset}; order was not submitted") from e
+        finally:
+            self._quote_update_events.pop(asset, None)
 
     async def _wait_for_order_result(self, request_id: str, order: "Order", timeout: float = 180.0) -> "OrderResult":
         start_time = time.time()
         warned = False
         while time.time() - start_time < timeout:
+            rejection = self._order_errors.get(request_id)
+            if rejection:
+                self._pending_order_requests.pop(request_id, None)
+                raise OrderError(f"Order {request_id} rejected by Quotex: {rejection}")
+
             if request_id in self._active_orders:
                 if self.enable_logging:
                     logger.info(f"Order {request_id} found in active tracking (opened)")
@@ -617,9 +674,31 @@ class AsyncQuotexClient:
         )
         raise OrderError(f"Order {request_id} timed out waiting for server confirmation")
 
+    def _get_order_wait_timeout(self, order_id: str) -> float:
+        order = self._active_orders.get(order_id)
+        if order is None:
+            # Check whether the order was tracked under a broker/server ID or mapped request ID.
+            mapped_server_id = self._request_id_to_server_id.get(order_id)
+            if mapped_server_id:
+                for candidate in self._active_orders.values():
+                    if str(candidate.broker_order_id) == str(mapped_server_id):
+                        order = candidate
+                        break
+
+        duration = 60
+        if order is not None and isinstance(order.duration, (int, float)):
+            duration = max(int(order.duration), 60)
+
+        expires_at = getattr(order, "expires_at", None)
+        if expires_at is not None:
+            remaining = (expires_at - datetime.now()).total_seconds()
+            return max(180.0, remaining + 30.0, float(duration) + 30.0)
+
+        return max(180.0, float(duration) + 30.0)
+
     async def check_win(self, order_id: str) -> tuple[Optional[float], Optional[str]]:
-        logger.info(f"check_win: Waiting for order {order_id} result.")
-        timeout = 180.0
+        timeout = self._get_order_wait_timeout(order_id)
+        logger.info(f"check_win: Waiting for order {order_id} result for up to {timeout:.1f}s.")
         start_time = time.time()
 
         while time.time() - start_time < timeout:
@@ -882,6 +961,9 @@ class AsyncQuotexClient:
 
             if parsed:
                 self._assets_data = parsed
+                update_assets_from_api(
+                    [{"symbol": symbol, "id": details["id"]} for symbol, details in parsed.items()]
+                )
                 self._last_assets_update = time.time()  # <-- track last refresh moment
                 logger.info(f"Stored {len(parsed)} assets from instruments/list")
 
@@ -1425,7 +1507,7 @@ class AsyncQuotexClient:
             # Optional: carry payout if present
             try:
                 payout = float(deal.get("percentProfit") or deal.get("payout") or 0.0)
-                final = final.copy(update={"payout": payout})
+                final = final.model_copy(update={"payout": payout})
             except Exception:
                 pass
 
@@ -1474,6 +1556,9 @@ class AsyncQuotexClient:
                             self._payout_data[asset] = price
                         except Exception:
                             pass
+                        quote_event = self._quote_update_events.get(asset)
+                        if quote_event:
+                            quote_event.set()
                         await self._on_price_update({
                             "symbol": asset,
                             "timestamp": timestamp,
@@ -1628,6 +1713,16 @@ class AsyncQuotexClient:
 
         await self._emit_event("error", data)
 
+    async def _on_order_rejected(self, data: Dict[str, Any]) -> None:
+        request_id = str(data.get("requestId") or "")
+        if not request_id or request_id not in self._pending_order_requests:
+            logger.warning("Received order rejection without a matching pending request: {}", data)
+            return
+        reason = str(data.get("error") or data.get("message") or data.get("code") or "unknown error")
+        self._order_errors[request_id] = reason
+        logger.warning("Order rejected by Quotex: requestId={}, reason={}", request_id, reason)
+        await self._emit_event("order_rejected", {"request_id": request_id, "reason": reason})
+
     async def _on_json_data(self, data: Any) -> None:
         try:
             # Handle dictionary-style events (canonical JSON)
@@ -1666,6 +1761,10 @@ class AsyncQuotexClient:
                         await self._on_order_opened(event_data)
                         return
 
+                    if event_type == "f_orders/open":
+                        await self._on_order_rejected(event_data)
+                        return
+
                     if event_type == "successopenOrder":
                         if isinstance(event_data, str):
                             logger.debug(f"Ignoring textual ACK for open: {event_data}")
@@ -1680,6 +1779,10 @@ class AsyncQuotexClient:
 
                     if event_type == "successcloseOrder":
                         await self._on_order_closed(event_data)
+                        return
+
+                    if event_type == "orders/opened/list":
+                        await self._on_orders_opened_list(event_data)
                         return
 
                     if event_type == "orders/closed/list":
@@ -1713,6 +1816,18 @@ class AsyncQuotexClient:
 
                 if event_type == "chart_notification/get":
                     await self._on_candles_received(event_data)
+                    return
+
+                if event_type == "orders/opened/list":
+                    await self._on_orders_opened_list(event_data)
+                    return
+
+                if event_type == "orders/closed/list":
+                    await self._on_orders_closed_list(event_data)
+                    return
+
+                if event_type == "f_orders/open":
+                    await self._on_order_rejected(event_data)
                     return
 
                 if event_type == "error":
@@ -1753,7 +1868,7 @@ class AsyncQuotexClient:
         if event in self._event_callbacks:
             for callback in self._event_callbacks[event]:
                 try:
-                    if asyncio.iscoroutinefunction(callback):
+                    if inspect.iscoroutinefunction(callback):
                         await callback(data)
                     else:
                         callback(data)
@@ -1900,12 +2015,8 @@ class AsyncQuotexClient:
         return int(time.mktime(base.timetuple()))
 
     def _compute_order_time_and_type(self, asset: str, duration) -> tuple[int, int]:
-        is_otc = self._is_otc(asset)
         secs = int(self._parse_seconds(duration))
-        if is_otc:
-            return 100, secs
-        mins = max(int((secs + 59) // 60), 1)
-        return 1, self._qx_expiration_epoch(int(time.time()), mins)
+        return 100, secs
 
     def _validate_order_parameters(self, asset: str, amount: float, direction: OrderDirection, duration: int) -> None:
         if asset not in ASSETS:
